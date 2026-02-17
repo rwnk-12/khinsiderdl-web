@@ -77,9 +77,15 @@ const checkGlobalWriteRateLimit = () => {
     return true;
 };
 
-const buildShareUrl = (requestUrl: string, shareId: string) => {
-    const base = new URL(requestUrl);
-    return `${base.origin}/playlists/shared/${encodeURIComponent(shareId)}`;
+const getPublicOrigin = (request: Request) => {
+    const forwardedHost = (request.headers.get('x-forwarded-host') || request.headers.get('host') || '').trim();
+    const forwardedProto = (request.headers.get('x-forwarded-proto') || '').trim().split(',')[0].trim() || 'https';
+    if (forwardedHost) return `${forwardedProto}://${forwardedHost}`;
+    return new URL(request.url).origin;
+};
+
+const buildShareUrl = (request: Request, shareId: string) => {
+    return `${getPublicOrigin(request)}/playlists/shared/${encodeURIComponent(shareId)}`;
 };
 
 const isShareCollisionError = (error: unknown) => {
@@ -114,7 +120,7 @@ export async function POST(request: Request) {
         if (reuseShareId) {
             const existingLink = await readPlaylistShareLinkRecord(reuseShareId);
             if (existingLink && !existingLink.revoked && existingLink.contentHash === contentHash) {
-                const url = buildShareUrl(request.url, reuseShareId);
+                const url = buildShareUrl(request, reuseShareId);
                 return jsonNoStore({ mode: 'server', shareId: reuseShareId, url, reused: true, contentHash }, 200);
             }
 
@@ -123,7 +129,7 @@ export async function POST(request: Request) {
                 if (legacyRecord) {
                     const legacyHash = computePlaylistShareContentHash(legacyRecord.playlist);
                     if (legacyHash === contentHash) {
-                        const url = buildShareUrl(request.url, reuseShareId);
+                        const url = buildShareUrl(request, reuseShareId);
                         return jsonNoStore({ mode: 'server', shareId: reuseShareId, url, reused: true, contentHash }, 200);
                     }
                 }
@@ -161,7 +167,7 @@ export async function POST(request: Request) {
             return jsonNoStore({ error: 'Failed to reserve a share id.' }, 500);
         }
 
-        const url = buildShareUrl(request.url, shareId);
+        const url = buildShareUrl(request, shareId);
         return jsonNoStore({
             mode: 'server',
             shareId,
