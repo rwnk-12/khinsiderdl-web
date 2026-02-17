@@ -82,10 +82,24 @@ const processTrack = async (item) => {
 const processAlbum = async (item) => {
     try {
         const zip = new JSZip();
-        self.postMessage({ id: item.id, status: 'progress', progress: 0, text: "Downloading Covers..." });
+        const albumImages = Array.isArray(item?.meta?.albumImages)
+            ? item.meta.albumImages.filter((imgUrl) => typeof imgUrl === 'string' && imgUrl.trim().length > 0)
+            : [];
+        const totalCovers = albumImages.length;
 
-        if (item.meta.albumImages && item.meta.albumImages.length > 0) {
-            const coverPromises = item.meta.albumImages.map(async (imgUrl) => {
+        if (totalCovers > 0) {
+            let completedCovers = 0;
+            const postCoverProgress = () => {
+                self.postMessage({
+                    id: item.id,
+                    status: 'progress',
+                    progress: 0,
+                    text: `Downloading covers (${completedCovers}/${totalCovers})...`
+                });
+            };
+
+            postCoverProgress();
+            const coverPromises = albumImages.map(async (imgUrl) => {
                 try {
                     const cRes = await fetch(`/api/image?url=${encodeURIComponent(imgUrl)}`);
                     if (cRes.ok) {
@@ -95,7 +109,11 @@ const processAlbum = async (item) => {
                             zip.file(`Art/${fileName}`, await cRes.arrayBuffer());
                         }
                     }
-                } catch (e) { }
+                } catch (e) {
+                } finally {
+                    completedCovers += 1;
+                    postCoverProgress();
+                }
             });
             await Promise.all(coverPromises);
         }

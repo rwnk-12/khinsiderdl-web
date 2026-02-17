@@ -1,25 +1,48 @@
 import React from 'react';
+import type { AudioQualityPreference } from '../lib/app-types';
 
-export const SettingsView = ({ currentQ, onSetQ }: { currentQ: string; onSetQ: (q: string) => void }) => (
-    <div className="settings-panel">
-        <h2 className="f-header" style={{ marginBottom: '2rem' }}>Settings</h2>
-        <div className="setting-group">
-            <h3 className="f-ui" style={{ marginBottom: '1rem' }}>Download Quality</h3>
-            {[
-                { value: 'best', label: 'Best Available', desc: 'Auto-selects highest quality (FLAC > AAC > MP3)' },
-                { value: 'flac', label: 'FLAC Only', desc: 'Lossless' },
-                { value: 'mp3', label: 'MP3', desc: 'Lossy.' },
-                { value: 'm4a', label: 'M4A/AAC', desc: 'Lossy' }
-            ].map(opt => (
-                <div key={opt.value}
-                    onClick={() => onSetQ(opt.value)}
-                    className={`setting-option ${currentQ === opt.value ? 'active' : ''}`}
-                >
-                    <div className="setting-label">{opt.label}</div>
-                    <div className="setting-desc">{opt.desc}</div>
+const QUALITY_OPTIONS: ReadonlyArray<{ value: AudioQualityPreference; label: string }> = [
+    { value: 'best', label: 'Best Available' },
+    { value: 'flac', label: 'FLAC Only' },
+    { value: 'mp3', label: 'MP3' },
+    { value: 'm4a', label: 'M4A / AAC' },
+];
+
+export const SettingsView = ({
+    currentQ,
+    onSetQ,
+}: {
+    currentQ: AudioQualityPreference;
+    onSetQ: (q: AudioQualityPreference) => void;
+}) => {
+    const activeOption = QUALITY_OPTIONS.find((opt) => opt.value === currentQ) || QUALITY_OPTIONS[0];
+
+    return (
+        <div className="settings-panel">
+            <section className="settings-surface settings-summary" aria-label="Current download preference">
+                <span className="f-ui settings-summary-kicker">Current Default</span>
+                <h2 className="settings-summary-title">{activeOption.label}</h2>
+            </section>
+
+            <section className="settings-surface setting-group" aria-label="Download quality options">
+                <div className="setting-group-head">
+                    <h3 className="setting-group-title">Download Quality</h3>
                 </div>
-            ))}
+                <div className="setting-options">
+                    {QUALITY_OPTIONS.map((opt) => (
+                        <button
+                            key={opt.value}
+                            type="button"
+                            onClick={() => onSetQ(opt.value)}
+                            className={`setting-option ${currentQ === opt.value ? 'active' : ''}`}
+                            aria-pressed={currentQ === opt.value}
+                        >
+                            <div className="setting-label">{opt.label}</div>
+                        </button>
+                    ))}
+                </div>
+            </section>
         </div>
-    </div>
-);
+    );
+};
 

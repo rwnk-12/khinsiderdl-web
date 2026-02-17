@@ -4,18 +4,23 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "lint": "node scripts/lint-guards.mjs && tsc --noEmit --pretty false",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test",
+    "playlist-share:report": "node scripts/playlist-share-report.mjs"
   },
   "dependencies": {
-    "cheerio": "^1.0.0-rc.12",
-    "next": "^15.5.9",
-    "react": "^19.2.3",
-    "react-dom": "^19.2.3"
+    "@tanstack/react-virtual": "^3.13.18",
+    "cheerio": "^1.2.0",
+    "next": "^16.1.6",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4"
   },
   "devDependencies": {
-    "@types/node": "^22.10.2",
-    "@types/react": "^18.3.12",
-    "@types/react-dom": "^18.3.1",
-    "typescript": "^5.7.2"
+    "@types/node": "^22.19.11",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "typescript": "^5.9.3"
   }
 }

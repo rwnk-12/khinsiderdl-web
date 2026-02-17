@@ -1,200 +1,308 @@
-export class EventBus {
-    listeners: Record<string, Function[]>;
-    constructor() {
-        this.listeners = {};
+import type { AlbumMeta, AudioQualityPreference, DownloadManagerState, QueueItem, QueueItemStatus, Track } from './app-types';
+import { readQualityPreference, writeQualityPreference } from './client-storage';
+import { LruCache } from './lru-cache';
+
+type ResolveResponse = Record<string, string>;
+
+type DownloadWorkerProgressMessage = {
+    id: string;
+    status: 'progress';
+    progress: number;
+    text?: string;
+    trackProgressMap?: Record<string, number>;
+};
+
+type DownloadWorkerCompleteMessage = {
+    id: string;
+    status: 'complete';
+    blob: Blob;
+    fileName: string;
+};
+
+type DownloadWorkerErrorMessage = {
+    id: string;
+    status: 'error';
+    error?: string;
+};
+
+type DownloadWorkerMessage = DownloadWorkerProgressMessage | DownloadWorkerCompleteMessage | DownloadWorkerErrorMessage;
+
+type DownloadManagerEvents = {
+    update: DownloadManagerState;
+    itemUpdate: QueueItem;
+};
+
+class EventBus {
+    private listeners: Record<keyof DownloadManagerEvents, Array<(payload: unknown) => void>> = {
+        update: [],
+        itemUpdate: [],
+    };
+
+    on<K extends keyof DownloadManagerEvents>(event: K, callback: (payload: DownloadManagerEvents[K]) => void) {
+        this.listeners[event].push(callback as (payload: unknown) => void);
     }
-    on(event: string, callback: Function) {
-        if (!this.listeners[event]) this.listeners[event] = [];
-        this.listeners[event].push(callback);
+
+    off<K extends keyof DownloadManagerEvents>(event: K, callback: (payload: DownloadManagerEvents[K]) => void) {
+        this.listeners[event] = this.listeners[event].filter((cb) => cb !== (callback as (payload: unknown) => void));
     }
-    off(event: string, callback: Function) {
-        if (!this.listeners[event]) return;
-        this.listeners[event] = this.listeners[event].filter(cb => cb !== callback);
-    }
-    emit(event: string, data?: any) {
-        if (this.listeners[event]) this.listeners[event].forEach(cb => cb(data));
+
+    protected emit<K extends keyof DownloadManagerEvents>(event: K, payload: DownloadManagerEvents[K]) {
+        this.listeners[event].forEach((cb) => cb(payload));
     }
 }
 
+const createQueueId = () => {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+        return crypto.randomUUID();
+    }
+    return `q_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+};
+
+const toSafeTrack = (value: unknown): Track => {
+    if (!value || typeof value !== 'object') return {};
+    return value as Track;
+};
+
+const toSafeAlbumMeta = (value: unknown): AlbumMeta => {
+    if (!value || typeof value !== 'object') return {};
+    return value as AlbumMeta;
+};
+
+const getFallbackAlbumName = (track: Track, meta: AlbumMeta) => {
+    return String(track.albumName || track.album || meta.name || 'Unknown Album');
+};
+
+const toStatusText = (raw: unknown, fallback: string) => {
+    const value = String(raw || '').trim();
+    return value || fallback;
+};
+
+const DOWNLOAD_PROGRESS_EMIT_INTERVAL_MS = 80;
+
 export class DownloadManager extends EventBus {
-    queue: any[];
-    active: any[];
-    completed: any[];
-    errors: any[];
-    concurrency: number;
-    qualityPref: string;
-    isProcessing: boolean;
-    resolveCache: Map<string, any>;
-    worker: Worker | null;
-    lastEmit: number;
+    queue: QueueItem[] = [];
+    active: QueueItem[] = [];
+    completed: QueueItem[] = [];
+    errors: QueueItem[] = [];
+    concurrency = 1;
+    qualityPref: AudioQualityPreference = 'best';
+    resolveCache = new LruCache<string, ResolveResponse>(400);
+    worker: Worker | null = null;
+    lastEmit = 0;
 
     constructor() {
         super();
-        this.queue = [];
-        this.active = [];
-        this.completed = [];
-        this.errors = [];
-        this.concurrency = 1;
-        this.qualityPref = 'best';
-        this.isProcessing = false;
-        this.resolveCache = new Map();
-        this.worker = null;
-        this.lastEmit = 0;
-
         if (typeof window !== 'undefined') {
             this.worker = new Worker('/worker.js');
-            this.worker.onmessage = (e) => this.handleMessage(e);
+            this.worker.onmessage = (event: MessageEvent<DownloadWorkerMessage>) => this.handleMessage(event);
         }
     }
+
     initializeQuality() {
+        if (typeof window === 'undefined') return;
+        this.qualityPref = readQualityPreference(window.localStorage, 'best');
+    }
+
+    setQuality(nextQuality: AudioQualityPreference) {
+        this.qualityPref = nextQuality;
         if (typeof window !== 'undefined') {
-            this.qualityPref = localStorage.getItem('quality') || 'best';
+            writeQualityPreference(window.localStorage, nextQuality);
         }
     }
-    setQuality(q: string) {
-        this.qualityPref = q;
-        localStorage.setItem('quality', q);
-    }
-    async resolveTrackFormats(url: string) {
-        if (this.resolveCache.has(url)) {
-            return this.resolveCache.get(url);
+
+    async resolveTrackFormats(url: string, signal?: AbortSignal) {
+        const normalizedUrl = String(url || '').trim();
+        if (!normalizedUrl) {
+            throw new Error('Resolve failed: missing URL');
         }
-        const res = await fetch(`/api/resolve?url=${encodeURIComponent(url)}`);
-        if (!res.ok) throw new Error(`Resolve failed: ${res.status}`);
-        const data = await res.json();
-        this.resolveCache.set(url, data);
+        const cached = this.resolveCache.get(normalizedUrl);
+        if (cached) {
+            return cached;
+        }
+        const response = await fetch(`/api/resolve?url=${encodeURIComponent(normalizedUrl)}`, signal ? { signal } : undefined);
+        if (!response.ok) throw new Error(`Resolve failed: ${response.status}`);
+        const data = (await response.json()) as ResolveResponse;
+        this.resolveCache.set(normalizedUrl, data);
         return data;
     }
-    pickDirectUrl(formats: Record<string, string>) {
+
+    pickDirectUrl(formats: ResolveResponse) {
         const pref = this.qualityPref || 'best';
-        const pick = (k: string) => formats?.[k] || null;
+        const pick = (key: string) => formats?.[key] || null;
         if (pref === 'flac') return pick('flac');
         if (pref === 'mp3') return pick('mp3');
         if (pref === 'm4a') return pick('m4a') || pick('aac');
         return pick('flac') || pick('m4a') || pick('mp3') || pick('ogg') || formats?.directUrl || null;
     }
-    addTrackToQueue(track: any, meta: any) {
-        const id = Math.random().toString(36).substr(2, 9);
-        const item = {
-            id,
+
+    addTrackToQueue(track: unknown, meta: unknown) {
+        const safeTrack = toSafeTrack(track);
+        const safeMeta = toSafeAlbumMeta(meta);
+
+        const normalizedMeta: AlbumMeta = {
+            ...safeMeta,
+            name: String(safeMeta.name || getFallbackAlbumName(safeTrack, safeMeta)),
+            tracks: Array.isArray(safeMeta.tracks) && safeMeta.tracks.length > 0 ? safeMeta.tracks : [safeTrack],
+            albumImages: Array.isArray(safeMeta.albumImages) ? safeMeta.albumImages : [],
+        };
+
+        const item: QueueItem = {
+            id: createQueueId(),
             type: 'track',
-            track,
-            meta,
+            track: safeTrack,
+            meta: normalizedMeta,
             status: 'pending',
             progress: 0,
             statusText: 'Waiting...',
             addedAt: Date.now(),
-            qualityPref: this.qualityPref
+            qualityPref: this.qualityPref,
         };
+
         this.queue.push(item);
         this.emit('update', this.getState());
         this.processQueue();
     }
-    addAlbumToQueue(meta: any) {
-        const id = Math.random().toString(36).substr(2, 9);
-        const item = {
-            id,
+
+    addAlbumToQueue(meta: unknown) {
+        const safeMeta = toSafeAlbumMeta(meta);
+        const safeTracks = Array.isArray(safeMeta.tracks) ? safeMeta.tracks : [];
+
+        const normalizedMeta: AlbumMeta = {
+            ...safeMeta,
+            name: String(safeMeta.name || 'Unknown Album'),
+            tracks: safeTracks,
+            albumImages: Array.isArray(safeMeta.albumImages) ? safeMeta.albumImages : [],
+        };
+
+        const item: QueueItem = {
+            id: createQueueId(),
             type: 'album',
-            meta,
-            tracks: meta.tracks,
+            meta: normalizedMeta,
+            tracks: safeTracks,
             status: 'pending',
             progress: 0,
             statusText: 'Waiting...',
             addedAt: Date.now(),
             trackProgressMap: {},
             currentTrackIndex: -1,
-            qualityPref: this.qualityPref
+            qualityPref: this.qualityPref,
         };
+
         this.queue.push(item);
         this.emit('update', this.getState());
         this.processQueue();
     }
+
     cancel(id: string) {
-        let idx = this.queue.findIndex(i => i.id === id);
-        if (idx > -1) {
-            this.queue.splice(idx, 1);
+        const queueIndex = this.queue.findIndex((item) => item.id === id);
+        if (queueIndex > -1) {
+            this.queue.splice(queueIndex, 1);
             this.emit('update', this.getState());
             return;
         }
-        const activeItem = this.active.find(i => i.id === id);
-        if (activeItem) {
-            this.active = this.active.filter(i => i.id !== id);
-            this.emit('update', this.getState());
-            this.processQueue();
-        }
-    }
-    processQueue() {
-        if (this.active.length < this.concurrency && this.queue.length > 0) {
-            const item = this.queue.shift();
-            item.status = 'downloading';
-            this.active.push(item);
-            this.emit('update', this.getState());
-            if (this.worker) this.worker.postMessage(item);
-        }
-    }
-    handleMessage(e: MessageEvent) {
-        const { id, status, progress, text, blob, fileName, error, trackProgressMap } = e.data;
-        const item = this.active.find(i => i.id === id);
-        if (!item) return;
 
-        if (status === 'progress') {
-            item.progress = progress;
-            item.statusText = text;
-            if (trackProgressMap) item.trackProgressMap = trackProgressMap;
+        const activeExists = this.active.some((item) => item.id === id);
+        if (!activeExists) return;
+
+        this.active = this.active.filter((item) => item.id !== id);
+        this.emit('update', this.getState());
+        this.processQueue();
+    }
+
+    processQueue() {
+        if (this.active.length >= this.concurrency || this.queue.length === 0) return;
+        const nextItem = this.queue.shift();
+        if (!nextItem) return;
+
+        nextItem.status = 'downloading';
+        this.active.push(nextItem);
+        this.emit('update', this.getState());
+        this.worker?.postMessage(nextItem);
+    }
+
+    handleMessage(event: MessageEvent<DownloadWorkerMessage>) {
+        const payload = event.data;
+        const activeItem = this.active.find((item) => item.id === payload.id);
+        if (!activeItem) return;
+
+        if (payload.status === 'progress') {
+            activeItem.progress = Number(payload.progress || 0);
+            activeItem.statusText = toStatusText(payload.text, 'Working...');
+            if (payload.trackProgressMap) {
+                activeItem.trackProgressMap = payload.trackProgressMap;
+            }
 
             const now = Date.now();
-            if (now - this.lastEmit > 32) {
-                this.emit('itemUpdate', item);
+            if (now - this.lastEmit > DOWNLOAD_PROGRESS_EMIT_INTERVAL_MS) {
+                this.emit('itemUpdate', activeItem);
                 this.lastEmit = now;
             }
-        } else if (status === 'complete') {
-            this.active = this.active.filter(i => i.id !== id);
-            item.status = 'completed';
-            item.progress = 100;
-            this.completed.unshift(item);
-            if (this.completed.length > 50) this.completed.pop();
+            return;
+        }
+
+        this.active = this.active.filter((item) => item.id !== payload.id);
+
+        if (payload.status === 'complete') {
+            activeItem.status = 'completed';
+            activeItem.progress = 100;
+            activeItem.statusText = 'Completed';
+            this.completed.unshift(activeItem);
+            if (this.completed.length > 50) {
+                this.completed.pop();
+            }
             this.emit('update', this.getState());
 
-            const url = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = fileName;
-            a.click();
-            setTimeout(() => URL.revokeObjectURL(url), 1000);
+            const objectUrl = URL.createObjectURL(payload.blob);
+            const anchor = document.createElement('a');
+            anchor.href = objectUrl;
+            anchor.download = payload.fileName;
+            anchor.click();
+            window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
             this.processQueue();
-        } else if (status === 'error') {
-            this.active = this.active.filter(i => i.id !== id);
-            item.status = 'error';
-            item.error = error;
-            this.errors.unshift(item);
-            this.emit('update', this.getState());
-            this.processQueue();
+            return;
         }
+
+        activeItem.status = 'error' as QueueItemStatus;
+        activeItem.error = toStatusText(payload.error, 'Download failed');
+        this.errors.unshift(activeItem);
+        this.emit('update', this.getState());
+        this.processQueue();
     }
-    getState() {
+
+    getState(): DownloadManagerState {
         return {
             queue: [...this.queue],
             active: [...this.active],
             completed: [...this.completed],
-            errors: [...this.errors]
+            errors: [...this.errors],
         };
     }
+
     retry(id: string) {
-        const errIdx = this.errors.findIndex(i => i.id === id);
-        if (errIdx > -1) {
-            const item = this.errors.splice(errIdx, 1)[0];
-            item.status = 'pending';
-            item.progress = 0;
-            item.error = null;
-            this.queue.push(item);
-            this.emit('update', this.getState());
-            this.processQueue();
-        }
+        const errorIndex = this.errors.findIndex((item) => item.id === id);
+        if (errorIndex < 0) return;
+
+        const item = this.errors.splice(errorIndex, 1)[0];
+        if (!item) return;
+        item.status = 'pending';
+        item.progress = 0;
+        item.error = null;
+        item.statusText = 'Waiting...';
+        this.queue.push(item);
+        this.emit('update', this.getState());
+        this.processQueue();
     }
+
     clearCompleted() {
         this.completed = [];
         this.errors = [];
         this.emit('update', this.getState());
+    }
+
+    getCacheStats() {
+        return {
+            resolveCacheSize: this.resolveCache.size,
+        };
     }
 }
 
