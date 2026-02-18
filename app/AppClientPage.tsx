@@ -6260,10 +6260,6 @@ export default function HomePage() {
                     ) : null}
                     <div className="app-shell-main">
                         <div ref={panelContentRef} className="panel-content medieval-scroll">
-                            <div className="panel-corner panel-corner-top-left" aria-hidden="true"></div>
-                            <div className="panel-corner panel-corner-top-right" aria-hidden="true"></div>
-                            <div className="panel-corner panel-corner-bottom-left" aria-hidden="true"></div>
-                            <div className="panel-corner panel-corner-bottom-right" aria-hidden="true"></div>
 
                             <div className="content-stack">
                                 {view === 'home' && (
