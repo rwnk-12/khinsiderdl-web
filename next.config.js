@@ -2,11 +2,7 @@ const nextConfig = {
   reactStrictMode: true,
 
   images: {
-    localPatterns: [
-      {
-        pathname: '/api/image',
-      },
-    ],
+    unoptimized: true,
     remotePatterns: [
       {
         protocol: 'https',
