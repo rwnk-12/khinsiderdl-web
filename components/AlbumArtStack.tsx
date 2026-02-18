@@ -10,14 +10,6 @@ type AlbumArtStackProps = {
 
 export const AlbumArtStack = ({ images, onClick, deferLoading, heroPriority = false }: AlbumArtStackProps) => {
     const [displayedImages, setDisplayedImages] = React.useState(images);
-    const [proxyFallbackIndices, setProxyFallbackIndices] = React.useState<Set<number>>(new Set());
-
-    const toProxyImageSrc = (rawUrl: string) => {
-        const value = String(rawUrl || '').trim();
-        if (!value) return '';
-        if (value.startsWith('/api/image?url=')) return value;
-        return `/api/image?url=${encodeURIComponent(value)}`;
-    };
 
     const toSmallThumbUrl = (rawUrl: string) => {
         const value = String(rawUrl || '').trim();
@@ -28,7 +20,6 @@ export const AlbumArtStack = ({ images, onClick, deferLoading, heroPriority = fa
     React.useEffect(() => {
         if (!deferLoading) {
             setDisplayedImages(images);
-            setProxyFallbackIndices(new Set());
         }
     }, [images, deferLoading]);
 
@@ -37,24 +28,12 @@ export const AlbumArtStack = ({ images, onClick, deferLoading, heroPriority = fa
     const getDisplaySource = (index: number) => {
         const raw = String(displayedImages[index] || '').trim();
         if (!raw) return '';
-        if (proxyFallbackIndices.has(index)) {
-            return toProxyImageSrc(raw);
-        }
         return raw;
     };
 
     const handleImgError = (index: number) => {
         const currentRaw = String(displayedImages[index] || '').trim();
         if (!currentRaw) return;
-
-        if (!proxyFallbackIndices.has(index)) {
-            setProxyFallbackIndices((prev) => {
-                const next = new Set(prev);
-                next.add(index);
-                return next;
-            });
-            return;
-        }
 
         const fallbackSmall = toSmallThumbUrl(currentRaw);
         if (fallbackSmall && fallbackSmall !== currentRaw) {
@@ -64,11 +43,6 @@ export const AlbumArtStack = ({ images, onClick, deferLoading, heroPriority = fa
                 next[index] = fallbackSmall;
                 return next;
             });
-            setProxyFallbackIndices((prev) => {
-                const next = new Set(prev);
-                next.delete(index);
-                return next;
-            });
             return;
         }
 
@@ -76,12 +50,6 @@ export const AlbumArtStack = ({ images, onClick, deferLoading, heroPriority = fa
             if (!prev[index]) return prev;
             const next = [...prev];
             next[index] = '';
-            return next;
-        });
-        setProxyFallbackIndices((prev) => {
-            if (!prev.has(index)) return prev;
-            const next = new Set(prev);
-            next.delete(index);
             return next;
         });
     };

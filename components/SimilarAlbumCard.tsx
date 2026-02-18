@@ -56,17 +56,9 @@ export const SimilarAlbumCard = ({
     const cardRef = useRef<HTMLDivElement>(null);
     const [isHovered, setIsHovered] = useState(false);
     const [rawThumb, setRawThumb] = useState(String(album?.thumb || '').trim());
-    const [useProxyFallback, setUseProxyFallback] = useState(false);
     const [isThumbLoaded, setIsThumbLoaded] = useState(false);
     const [hasEnteredViewport, setHasEnteredViewport] = useState(!deferLoading);
     const [resolvedMeta, setResolvedMeta] = useState<{ albumType?: string; year?: string }>({});
-
-    const toProxyImageSrc = (rawUrl: string) => {
-        const value = String(rawUrl || '').trim();
-        if (!value) return '';
-        if (value.startsWith('/api/image?url=')) return value;
-        return `/api/image?url=${encodeURIComponent(value)}`;
-    };
 
     const toSmallThumbUrl = (rawUrl: string) => {
         const value = String(rawUrl || '').trim();
@@ -76,7 +68,6 @@ export const SimilarAlbumCard = ({
 
     React.useEffect(() => {
         setRawThumb(String(album?.thumb || '').trim());
-        setUseProxyFallback(false);
         setIsThumbLoaded(false);
         if (!deferLoading) setHasEnteredViewport(true);
     }, [album?.thumb, deferLoading]);
@@ -114,8 +105,8 @@ export const SimilarAlbumCard = ({
 
     const displayedThumb = React.useMemo(() => {
         if (!rawThumb) return '';
-        return useProxyFallback ? toProxyImageSrc(rawThumb) : rawThumb;
-    }, [rawThumb, useProxyFallback]);
+        return rawThumb;
+    }, [rawThumb]);
     const shouldAttemptImageLoad = hasEnteredViewport && !!displayedThumb;
 
     React.useEffect(() => {
@@ -146,20 +137,14 @@ export const SimilarAlbumCard = ({
 
     const handleImgError = React.useCallback(() => {
         if (!rawThumb) return;
-        if (!useProxyFallback) {
-            setUseProxyFallback(true);
-            return;
-        }
         const fallbackSmall = toSmallThumbUrl(rawThumb);
         if (fallbackSmall && fallbackSmall !== rawThumb) {
             setRawThumb(fallbackSmall);
-            setUseProxyFallback(false);
             return;
         }
         setRawThumb('');
-        setUseProxyFallback(false);
         setIsThumbLoaded(true);
-    }, [rawThumb, useProxyFallback]);
+    }, [rawThumb]);
 
     const syncThumbLoadedStateFromDom = React.useCallback(() => {
         if (!shouldAttemptImageLoad || !displayedThumb) return;
@@ -188,22 +173,16 @@ export const SimilarAlbumCard = ({
     React.useEffect(() => {
         if (!shouldAttemptImageLoad || !displayedThumb || isThumbLoaded) return;
         const timeoutId = window.setTimeout(() => {
-            if (!useProxyFallback) {
-                setUseProxyFallback(true);
-                return;
-            }
             const fallbackSmall = toSmallThumbUrl(rawThumb);
             if (fallbackSmall && fallbackSmall !== rawThumb) {
                 setRawThumb(fallbackSmall);
-                setUseProxyFallback(false);
                 return;
             }
             setRawThumb('');
-            setUseProxyFallback(false);
             setIsThumbLoaded(true);
         }, SIMILAR_CARD_IMAGE_LOAD_TIMEOUT_MS);
         return () => window.clearTimeout(timeoutId);
-    }, [displayedThumb, isThumbLoaded, rawThumb, shouldAttemptImageLoad, useProxyFallback]);
+    }, [displayedThumb, isThumbLoaded, rawThumb, shouldAttemptImageLoad]);
 
     const albumType = String(album?.albumType || album?.type || resolvedMeta.albumType || '').trim();
     const year = String(album?.year || resolvedMeta.year || '').trim();

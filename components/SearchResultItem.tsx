@@ -18,11 +18,7 @@ export const SearchResultItem = ({ item, isSelected, onSelect, toTitleCase, defe
     }, [item.icon]);
 
     const handleImgError = (e: any) => {
-        if (displayedIcon && !e.target.src.includes('/api/image')) {
-            e.target.src = `/api/image?url=${encodeURIComponent(displayedIcon)}`;
-        } else {
-            e.target.style.display = 'none';
-        }
+        e.target.style.display = 'none';
     };
 
     return (
@@ -40,8 +36,6 @@ export const SearchResultItem = ({ item, isSelected, onSelect, toTitleCase, defe
                     onError={handleImgError}
                     alt=""
                     loading="lazy"
-                    // @ts-ignore
-                    fetchPriority="low"
                 />
             )}
             <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>

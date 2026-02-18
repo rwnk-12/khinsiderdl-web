@@ -13,13 +13,6 @@ const toSmallThumbUrl = (rawUrl: string) => {
     return value.includes('/thumbs_large/') ? value.replace('/thumbs_large/', '/thumbs_small/') : value;
 };
 
-const toProxyImageSrc = (rawUrl: string) => {
-    const value = String(rawUrl || '').trim();
-    if (!value) return '';
-    if (value.startsWith('/api/image?url=')) return value;
-    return `/api/image?url=${encodeURIComponent(value)}`;
-};
-
 type HomeAlbumCardProps = {
     title: string;
     imageUrl: string;
@@ -27,7 +20,6 @@ type HomeAlbumCardProps = {
     metaLine?: string;
     lightweightTextMode?: boolean;
     priority?: boolean;
-    allowProxyFallback?: boolean;
     showImage?: boolean;
     pageShowSignal?: number;
     onWarmup?: () => void;
@@ -42,7 +34,6 @@ export const HomeAlbumCard = React.memo(({
     metaLine,
     lightweightTextMode = false,
     priority = false,
-    allowProxyFallback = true,
     showImage = true,
     pageShowSignal = 0,
     onWarmup,
@@ -52,14 +43,12 @@ export const HomeAlbumCard = React.memo(({
     const cardRef = useRef<HTMLButtonElement | null>(null);
     const [isHovered, setIsHovered] = useState(false);
     const [rawImageSrc, setRawImageSrc] = useState(String(imageUrl || '').trim());
-    const [useProxyFallback, setUseProxyFallback] = useState(false);
     const [isImageLoaded, setIsImageLoaded] = useState(false);
     const [hasEnteredViewport, setHasEnteredViewport] = useState(priority);
     const shouldAttemptImageLoad = showImage && (priority || hasEnteredViewport);
 
     useEffect(() => {
         setRawImageSrc(String(imageUrl || '').trim());
-        setUseProxyFallback(false);
         setIsImageLoaded(false);
     }, [imageUrl]);
 
@@ -103,9 +92,8 @@ export const HomeAlbumCard = React.memo(({
 
     const displayImageSrc = useMemo(() => {
         if (!rawImageSrc) return '';
-        if (allowProxyFallback && useProxyFallback) return toProxyImageSrc(rawImageSrc);
         return rawImageSrc;
-    }, [allowProxyFallback, rawImageSrc, useProxyFallback]);
+    }, [rawImageSrc]);
 
     useEffect(() => {
         if (!shouldAttemptImageLoad) {
@@ -116,19 +104,13 @@ export const HomeAlbumCard = React.memo(({
     }, [displayImageSrc, shouldAttemptImageLoad]);
 
     const handleImageError = useCallback(() => {
-        if (allowProxyFallback && !useProxyFallback) {
-            setUseProxyFallback(true);
-            return;
-        }
         const fallbackSmall = toSmallThumbUrl(rawImageSrc);
         if (fallbackSmall && fallbackSmall !== rawImageSrc) {
             setRawImageSrc(fallbackSmall);
-            setUseProxyFallback(false);
             return;
         }
         setRawImageSrc('');
-        setUseProxyFallback(false);
-    }, [allowProxyFallback, rawImageSrc, useProxyFallback]);
+    }, [rawImageSrc]);
 
     const syncImageLoadedStateFromDom = useCallback(() => {
         if (!shouldAttemptImageLoad || !displayImageSrc) return;
@@ -157,23 +139,17 @@ export const HomeAlbumCard = React.memo(({
     useEffect(() => {
         if (!shouldAttemptImageLoad || !displayImageSrc || isImageLoaded) return;
         const timeoutId = window.setTimeout(() => {
-            if (allowProxyFallback && !useProxyFallback) {
-                setUseProxyFallback(true);
-                return;
-            }
             const fallbackSmall = toSmallThumbUrl(rawImageSrc);
             if (fallbackSmall && fallbackSmall !== rawImageSrc) {
                 setRawImageSrc(fallbackSmall);
-                setUseProxyFallback(false);
                 return;
             }
             setRawImageSrc('');
-            setUseProxyFallback(false);
             setIsImageLoaded(true);
         }, HOME_CARD_IMAGE_LOAD_TIMEOUT_MS);
 
         return () => window.clearTimeout(timeoutId);
-    }, [allowProxyFallback, displayImageSrc, isImageLoaded, rawImageSrc, shouldAttemptImageLoad, useProxyFallback]);
+    }, [displayImageSrc, isImageLoaded, rawImageSrc, shouldAttemptImageLoad]);
 
     const warmup = () => {
         setHasEnteredViewport(true);

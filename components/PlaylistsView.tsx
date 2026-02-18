@@ -73,7 +73,7 @@ const normalizeCoverUrl = (raw: unknown) => String(raw ?? '').trim();
 
 const getTrackIdentityKey = (track: any, index: number, scope: string) => {
     const primary = String(track?.trackKey || track?.url || '').trim();
-    if (primary) return `${scope}-${primary}`;
+    if (primary) return `${scope}-${primary}-${index}`;
     const title = String(track?.title || '').trim().toLowerCase();
     const album = String(track?.albumName || '').trim().toLowerCase();
     const addedAt = Number(track?.addedAt || 0);
@@ -82,12 +82,12 @@ const getTrackIdentityKey = (track: any, index: number, scope: string) => {
 
 const getCoverIdentityKey = (scope: string, rawCoverUrl: unknown, index: number) => {
     const normalized = normalizeCoverUrl(rawCoverUrl);
-    if (normalized) return `${scope}-${normalized}`;
+    if (normalized) return `${scope}-${normalized}-${index}`;
     return `${scope}-cover-${index}`;
 };
 
 const PLAYLIST_COVER_LOAD_TIMEOUT_MS = 9000;
-const IDENTIFIER_VIRTUALIZATION_MIN_ITEMS = 120;
+const IDENTIFIER_VIRTUALIZATION_MIN_ITEMS = Number.MAX_SAFE_INTEGER;
 const IDENTIFIER_VIRTUALIZATION_OVERSCAN_ROWS = 8;
 const IDENTIFIER_VIRTUALIZATION_FALLBACK_ROW_HEIGHT = 56;
 
@@ -756,7 +756,7 @@ export const PlaylistsView: React.FC<PlaylistsViewProps> = ({
                                 {sharedPlaylistStatus === 'loading'
                                     ? 'Loading shared playlist...'
                                     : sharedPlaylistStatus === 'not_found'
-                                        ? 'Shared playlist not found.'
+                                        ? 'This playlist was removed.'
                                         : sharedPlaylistStatus === 'error'
                                             ? 'Shared playlist link is invalid or corrupted.'
                                             : 'No shared playlist data found in this link.'}

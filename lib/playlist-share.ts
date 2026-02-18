@@ -6,7 +6,9 @@ export const MAX_SHARED_PLAYLIST_TRACKS = 2000;
 export const MAX_SHARED_PLAYLIST_JSON_BYTES = 1024 * 1024;
 export const MAX_SHARED_HASH_URL_LENGTH = 7800;
 export const SHARED_PLAYLIST_HASH_PREFIX = 'khs1.';
+export const SHARED_PLAYLIST_SEALED_PREFIX = 'khe1.';
 export const SHARED_PLAY_ID_REGEX = /^[A-Za-z0-9_-]{16,64}$/;
+export const SHARED_PLAYLIST_ENCRYPTION_ALG = 'A256GCM' as const;
 
 export type SharedPlaylistSnapshot = {
     name: string;
@@ -19,6 +21,20 @@ export type SharedPlaylistRecordV1 = {
     shareId: string;
     createdAt: string;
     playlist: SharedPlaylistSnapshot;
+};
+
+export type SharedPlaylistEncryptedPayloadV1 = {
+    version: 1;
+    alg: typeof SHARED_PLAYLIST_ENCRYPTION_ALG;
+    iv: string;
+    ciphertext: string;
+};
+
+export type SharedPlaylistEncryptedRecordV1 = {
+    version: 1;
+    shareId: string;
+    createdAt: string;
+    encrypted: SharedPlaylistEncryptedPayloadV1;
 };
 
 export type SharedPlaylistNormalizeResult =
@@ -41,6 +57,16 @@ const getUtf8ByteLength = (value: string) => {
         return Buffer.byteLength(value, 'utf8');
     }
     return unescape(encodeURIComponent(value)).length;
+};
+
+const BASE64URL_FIELD_REGEX = /^[A-Za-z0-9_-]+$/;
+
+const normalizeBase64UrlField = (value: unknown, minLength: number, maxLength: number) => {
+    const normalized = String(value || '').trim();
+    if (!normalized) return '';
+    if (!BASE64URL_FIELD_REGEX.test(normalized)) return '';
+    if (normalized.length < minLength || normalized.length > maxLength) return '';
+    return normalized;
 };
 
 const bytesToBase64 = (bytes: Uint8Array) => {
@@ -195,6 +221,10 @@ export const normalizeSharedPlaylistRecord = (raw: any): SharedPlaylistRecordV1 
     const createdAtDate = new Date(createdAtRaw);
     if (!createdAtRaw || Number.isNaN(createdAtDate.getTime())) return null;
 
+    // Plain records must carry an explicit playlist payload.
+    if (!Object.prototype.hasOwnProperty.call(raw, 'playlist')) return null;
+    if (!(raw as any).playlist || typeof (raw as any).playlist !== 'object') return null;
+
     const normalized = normalizeSharedPlaylistPayload((raw as any).playlist);
     if (!normalized.ok) return null;
 
@@ -203,6 +233,89 @@ export const normalizeSharedPlaylistRecord = (raw: any): SharedPlaylistRecordV1 
         shareId,
         createdAt: createdAtDate.toISOString(),
         playlist: normalized.playlist,
+    };
+};
+
+export const normalizeSharedPlaylistEncryptedPayload = (raw: any): SharedPlaylistEncryptedPayloadV1 | null => {
+    if (!raw || typeof raw !== 'object') return null;
+    const version = Number((raw as any).version);
+    if (version !== 1) return null;
+
+    const alg = String((raw as any).alg || '').trim();
+    if (alg !== SHARED_PLAYLIST_ENCRYPTION_ALG) return null;
+
+    const iv = normalizeBase64UrlField((raw as any).iv, 12, 40);
+    if (!iv) return null;
+
+    const ciphertext = normalizeBase64UrlField((raw as any).ciphertext, 24, 2_000_000);
+    if (!ciphertext) return null;
+
+    return {
+        version: 1,
+        alg: SHARED_PLAYLIST_ENCRYPTION_ALG,
+        iv,
+        ciphertext,
+    };
+};
+
+export const encodeSharedPlaylistEncryptedEnvelope = (payload: SharedPlaylistEncryptedPayloadV1): string => {
+    const normalized = normalizeSharedPlaylistEncryptedPayload(payload);
+    if (!normalized) {
+        throw new Error('Invalid encrypted shared playlist payload.');
+    }
+
+    const packed = JSON.stringify({
+        v: 1,
+        i: normalized.iv,
+        c: normalized.ciphertext,
+    });
+    return `${SHARED_PLAYLIST_SEALED_PREFIX}${utf8ToBase64Url(packed)}`;
+};
+
+export const decodeSharedPlaylistEncryptedEnvelope = (raw: unknown): SharedPlaylistEncryptedPayloadV1 | null => {
+    const sealed = String(raw || '').trim();
+    if (!sealed.startsWith(SHARED_PLAYLIST_SEALED_PREFIX)) return null;
+    const encoded = sealed.slice(SHARED_PLAYLIST_SEALED_PREFIX.length).trim();
+    if (!encoded) return null;
+
+    try {
+        const parsed = JSON.parse(base64UrlToUtf8(encoded));
+        const version = Number(parsed?.v);
+        if (version !== 1) return null;
+        return normalizeSharedPlaylistEncryptedPayload({
+            version: 1,
+            alg: SHARED_PLAYLIST_ENCRYPTION_ALG,
+            iv: (parsed as any).i,
+            ciphertext: (parsed as any).c,
+        });
+    } catch {
+        return null;
+    }
+};
+
+export const normalizeSharedPlaylistEncryptedRecord = (raw: any): SharedPlaylistEncryptedRecordV1 | null => {
+    if (!raw || typeof raw !== 'object') return null;
+    const version = Number((raw as any).version);
+    if (version !== 1) return null;
+
+    const shareId = String((raw as any).shareId || '').trim();
+    if (!SHARED_PLAY_ID_REGEX.test(shareId)) return null;
+
+    const createdAtRaw = String((raw as any).createdAt || '').trim();
+    const createdAtDate = new Date(createdAtRaw);
+    if (!createdAtRaw || Number.isNaN(createdAtDate.getTime())) return null;
+
+    const encrypted = normalizeSharedPlaylistEncryptedPayload((raw as any).encrypted)
+        || decodeSharedPlaylistEncryptedEnvelope(
+            (raw as any).sealed || (raw as any).payload || (raw as any).data
+        );
+    if (!encrypted) return null;
+
+    return {
+        version: 1,
+        shareId,
+        createdAt: createdAtDate.toISOString(),
+        encrypted,
     };
 };
 

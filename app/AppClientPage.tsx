@@ -29,11 +29,10 @@ import type { AudioQualityPreference, LikedTrack, Track } from '../lib/app-types
 import { readLikedTracksFromStorage, writeLikedTracksToStorage } from '../lib/client-storage';
 import type { SharedPlaylistRecordV1 } from '../lib/playlist-share';
 import {
-    MAX_SHARED_HASH_URL_LENGTH,
-    decodeSharedPlaylistHash,
-    encodeSharedPlaylistHash,
+    SHARED_PLAY_ID_REGEX,
     normalizeSharedPlaylistPayload,
 } from '../lib/playlist-share';
+import { getSharedPlaylistKeyFromHash } from '../lib/playlist-share-crypto';
 
 import { SimilarAlbums } from '../components/SimilarAlbums';
 import { GalleryPortalHost, type GalleryPortalHostHandle } from '../components/GalleryPortalHost';
@@ -386,6 +385,17 @@ type PlaylistCreateAndAddResult = {
 type SharedPlaylistMode = 'none' | 'server' | 'hash';
 type SharedPlaylistStatus = 'idle' | 'loading' | 'ready' | 'error' | 'not_found';
 type InlineToastTone = 'success' | 'error';
+type PlaylistShareReuseCacheEntry = {
+    shareId: string;
+    updatedAt: number;
+    contentHash?: string;
+};
+type PlaylistShareReuseCache = Record<string, PlaylistShareReuseCacheEntry[]>;
+type PlaylistShareSecretEntry = {
+    updatedAt: number;
+    editToken?: string;
+    shareKey?: string;
+};
 
 const DEFAULT_SEARCH_FILTERS: SearchFilters = {
     q: '',
@@ -544,6 +554,8 @@ const PLAYLIST_SHARE_REUSE_CACHE_KEY = 'kh_playlist_share_reuse_v1';
 const PLAYLIST_SHARE_REUSE_CACHE_LIMIT = 300;
 const PLAYLIST_SHARE_HINT_ON_SHARE_SEEN_KEY = 'kh_playlist_share_hint_on_share_seen_v1';
 const PLAYLIST_SHARE_HINT_ON_OPEN_SEEN_KEY = 'kh_playlist_share_hint_on_open_seen_v1';
+const SHARED_PLAYLIST_INVALIDATION_EVENT_KEY = 'kh_shared_playlist_invalidate_v1';
+const SHARED_PLAYLIST_REVALIDATE_INTERVAL_MS = 15000;
 const LIKED_META_CACHE_MAX_ENTRIES = 300;
 const DL_UI_UPDATE_MIN_INTERVAL_MS = 96;
 const PERF_QUEUE_TOGGLE_START_MARK = 'perf_queue_toggle_start';
@@ -562,6 +574,179 @@ const PERF_GALLERY_VISIBLE_MARK = 'perf_gallery_visible';
 const PERF_GALLERY_FIRST_IMAGE_MARK = 'perf_gallery_first_image_loaded';
 const PERF_GALLERY_OPEN_MEASURE = 'perf_gallery_open_to_visible';
 const PERF_GALLERY_FIRST_IMAGE_MEASURE = 'perf_gallery_visible_to_first_image';
+
+const normalizePlaylistShareReuseCacheEntry = (
+    rawEntry: any,
+    fallbackUpdatedAt = Date.now()
+): PlaylistShareReuseCacheEntry | null => {
+    const shareId = String(rawEntry?.shareId || '').trim();
+    if (!SHARED_PLAY_ID_REGEX.test(shareId)) return null;
+
+    const updatedAtRaw = Number(rawEntry?.updatedAt);
+    const updatedAt = Number.isFinite(updatedAtRaw) && updatedAtRaw > 0
+        ? Math.floor(updatedAtRaw)
+        : fallbackUpdatedAt;
+
+    const contentHash = String(rawEntry?.contentHash || '').trim();
+    return {
+        shareId,
+        updatedAt,
+        ...(contentHash ? { contentHash } : {}),
+    };
+};
+
+const dedupePlaylistShareReuseEntries = (entries: PlaylistShareReuseCacheEntry[]) => {
+    const byShareId = new Map<string, PlaylistShareReuseCacheEntry>();
+    entries.forEach((entry, index) => {
+        const normalized = normalizePlaylistShareReuseCacheEntry(entry, Date.now() - index);
+        if (!normalized) return;
+
+        const previous = byShareId.get(normalized.shareId);
+        if (!previous) {
+            byShareId.set(normalized.shareId, normalized);
+            return;
+        }
+
+        const updatedAt = Math.max(previous.updatedAt, normalized.updatedAt);
+        const contentHash = String(normalized.contentHash || previous.contentHash || '').trim();
+        byShareId.set(normalized.shareId, {
+            shareId: normalized.shareId,
+            updatedAt,
+            ...(contentHash ? { contentHash } : {}),
+        });
+    });
+
+    return [...byShareId.values()].sort((a, b) => b.updatedAt - a.updatedAt);
+};
+
+const normalizePlaylistShareReuseCache = (rawCache: any): PlaylistShareReuseCache => {
+    if (!rawCache || typeof rawCache !== 'object') return {};
+
+    const normalized: PlaylistShareReuseCache = {};
+    Object.entries(rawCache).forEach(([rawPlaylistId, rawEntries]) => {
+        const playlistId = String(rawPlaylistId || '').trim();
+        if (!playlistId) return;
+
+        const entriesInput = Array.isArray(rawEntries)
+            ? rawEntries
+            : (rawEntries && typeof rawEntries === 'object' ? [rawEntries] : []);
+        const entries = dedupePlaylistShareReuseEntries(entriesInput as PlaylistShareReuseCacheEntry[]);
+        if (entries.length === 0) return;
+        normalized[playlistId] = entries;
+    });
+
+    return normalized;
+};
+
+const prunePlaylistShareReuseCache = (cache: PlaylistShareReuseCache): PlaylistShareReuseCache => {
+    const flattened: Array<{ playlistId: string; entry: PlaylistShareReuseCacheEntry }> = [];
+
+    Object.entries(normalizePlaylistShareReuseCache(cache)).forEach(([playlistId, entries]) => {
+        entries.forEach((entry) => {
+            flattened.push({ playlistId, entry });
+        });
+    });
+
+    flattened.sort((a, b) => b.entry.updatedAt - a.entry.updatedAt);
+    const kept = flattened.slice(0, PLAYLIST_SHARE_REUSE_CACHE_LIMIT);
+
+    const next: PlaylistShareReuseCache = {};
+    kept.forEach(({ playlistId, entry }) => {
+        if (!next[playlistId]) next[playlistId] = [];
+        next[playlistId].push(entry);
+    });
+
+    Object.keys(next).forEach((playlistId) => {
+        const deduped = dedupePlaylistShareReuseEntries(next[playlistId] || []);
+        if (deduped.length > 0) {
+            next[playlistId] = deduped;
+        } else {
+            delete next[playlistId];
+        }
+    });
+
+    return next;
+};
+
+const readPlaylistShareReuseCache = (storage: Storage | null | undefined): PlaylistShareReuseCache => {
+    if (!storage) return {};
+    try {
+        const rawCache = storage.getItem(PLAYLIST_SHARE_REUSE_CACHE_KEY);
+        if (!rawCache) return {};
+        const parsed = JSON.parse(rawCache);
+        return prunePlaylistShareReuseCache(normalizePlaylistShareReuseCache(parsed));
+    } catch {
+        return {};
+    }
+};
+
+const writePlaylistShareReuseCache = (
+    storage: Storage | null | undefined,
+    cache: PlaylistShareReuseCache
+) => {
+    if (!storage) return;
+    try {
+        const normalized = prunePlaylistShareReuseCache(normalizePlaylistShareReuseCache(cache));
+        if (Object.keys(normalized).length === 0) {
+            storage.removeItem(PLAYLIST_SHARE_REUSE_CACHE_KEY);
+            return;
+        }
+        storage.setItem(PLAYLIST_SHARE_REUSE_CACHE_KEY, JSON.stringify(normalized));
+    } catch {
+    }
+};
+
+const upsertPlaylistShareReuseCacheEntry = (
+    cache: PlaylistShareReuseCache,
+    playlistId: string,
+    rawEntry: PlaylistShareReuseCacheEntry
+) => {
+    const normalizedPlaylistId = String(playlistId || '').trim();
+    if (!normalizedPlaylistId) return prunePlaylistShareReuseCache(normalizePlaylistShareReuseCache(cache));
+
+    const normalizedEntry = normalizePlaylistShareReuseCacheEntry(rawEntry);
+    if (!normalizedEntry) return prunePlaylistShareReuseCache(normalizePlaylistShareReuseCache(cache));
+
+    const nextCache = normalizePlaylistShareReuseCache(cache);
+    const existingEntries = Array.isArray(nextCache[normalizedPlaylistId]) ? nextCache[normalizedPlaylistId] : [];
+    nextCache[normalizedPlaylistId] = dedupePlaylistShareReuseEntries([
+        ...existingEntries,
+        normalizedEntry,
+    ]);
+
+    return prunePlaylistShareReuseCache(nextCache);
+};
+
+const removePlaylistShareReuseCacheEntries = (cache: PlaylistShareReuseCache, playlistId: string) => {
+    const normalizedPlaylistId = String(playlistId || '').trim();
+    const normalizedCache = normalizePlaylistShareReuseCache(cache);
+    if (!normalizedPlaylistId || !normalizedCache[normalizedPlaylistId]) {
+        return prunePlaylistShareReuseCache(normalizedCache);
+    }
+
+    const { [normalizedPlaylistId]: _removed, ...remaining } = normalizedCache;
+    return prunePlaylistShareReuseCache(remaining);
+};
+
+const notifySharedPlaylistInvalidation = (storage: Storage | null | undefined, shareIds: string[]) => {
+    if (!storage) return;
+    const uniqueShareIds = Array.from(
+        new Set(
+            shareIds
+                .map((shareId) => String(shareId || '').trim())
+                .filter((shareId) => SHARED_PLAY_ID_REGEX.test(shareId))
+        )
+    );
+    if (uniqueShareIds.length === 0) return;
+
+    try {
+        storage.setItem(SHARED_PLAYLIST_INVALIDATION_EVENT_KEY, JSON.stringify({
+            shareIds: uniqueShareIds,
+            at: Date.now(),
+        }));
+    } catch {
+    }
+};
 
 const readLikedMetaCacheTimestamp = (value: any, fallback: number) => {
     const direct = Number(value?.__cacheTs);
@@ -716,6 +901,7 @@ const isSamePlaybackTrack = (a: any, b: any) => {
 export default function HomePage() {
     const [view, setView] = useState<AppView>('home');
     const [query, setQuery] = useState('');
+    const [isSearchInputFocused, setIsSearchInputFocused] = useState(false);
     const [activeSearchTerm, setActiveSearchTerm] = useState('');
     const [results, setResults] = useState<any[]>([]);
     const [searchFilters, setSearchFilters] = useState<SearchFilters>(DEFAULT_SEARCH_FILTERS);
@@ -772,6 +958,7 @@ export default function HomePage() {
     const playbackSourceLabelRef = useRef('');
     const [isMobileFullScreen, setMobileFullScreen] = useState(false);
     const lastStableUrlRef = useRef('');
+    const searchInputRef = useRef<HTMLInputElement | null>(null);
     const galleryHostRef = useRef<GalleryPortalHostHandle | null>(null);
     const queueOverlayHostRef = useRef<QueueOverlayHostHandle | null>(null);
     const toggleQueueOverlay = useCallback(() => {
@@ -835,6 +1022,7 @@ export default function HomePage() {
     }, [selectedAlbum]);
     const [trackFilterQuery, setTrackFilterQuery] = useState('');
     const [isDesktopViewport, setIsDesktopViewport] = useState(false);
+    const previousIsDesktopViewportRef = useRef<boolean | null>(null);
     const [virtualTrackRowHeight, setVirtualTrackRowHeight] = useState(TRACKLIST_VIRTUALIZATION_FALLBACK_ROW_HEIGHT);
     const [virtualTrackRange, setVirtualTrackRange] = useState<{ start: number; end: number }>({ start: 0, end: -1 });
     const [virtualHomeGridRowHeight, setVirtualHomeGridRowHeight] = useState(HOME_FEED_VIRTUALIZATION_FALLBACK_ROW_HEIGHT);
@@ -845,6 +1033,13 @@ export default function HomePage() {
     const [albumDescCollapsedText, setAlbumDescCollapsedText] = useState('');
     const [isAllCommentsVisible, setIsAllCommentsVisible] = useState(false);
 
+    const closeMobileSearchInput = useCallback(() => {
+        searchInputRef.current?.blur();
+        setIsSearchInputFocused(false);
+    }, []);
+    const shouldTrapSearchBackForKeyboard = !isDesktopViewport && isSearchInputFocused;
+
+    useHistoryState('search-input-focus', shouldTrapSearchBackForKeyboard, closeMobileSearchInput);
     useHistoryState('player', isMobileFullScreen, () => setMobileFullScreen(false));
 
     const [likedTracks, setLikedTracks] = useState<LikedTrack[]>([]);
@@ -871,6 +1066,7 @@ export default function HomePage() {
     const [sharedPlaylistMode, setSharedPlaylistMode] = useState<SharedPlaylistMode>('none');
     const [sharedPlaylistStatus, setSharedPlaylistStatus] = useState<SharedPlaylistStatus>('idle');
     const [sharedPlaylistData, setSharedPlaylistData] = useState<SharedPlaylistRecordV1 | null>(null);
+    const [sharedPlaylistServerKey, setSharedPlaylistServerKey] = useState('');
     const [playlistPickerState, setPlaylistPickerState] = useState<PlaylistPickerState>({
         open: false,
         mode: 'track',
@@ -936,6 +1132,7 @@ export default function HomePage() {
     const queueRef = useRef<Track[]>([]);
     const manualQueueIndexByTrackKeyRef = useRef<Map<string, number>>(new Map());
     const queueEnqueuePendingRef = useRef(false);
+    const playlistShareSecretsRef = useRef<Record<string, Record<string, PlaylistShareSecretEntry>>>({});
     const sharedPlaylistLoadSeqRef = useRef(0);
     const pendingSharedTrackTargetRef = useRef<ParsedTrackShareTarget>(parseTrackShareTarget(''));
     const pendingSharedTrackAlbumIdRef = useRef('');
@@ -965,6 +1162,12 @@ export default function HomePage() {
                 playlistAddFeedbackTimersRef.current = [];
             }
         };
+    }, []);
+
+    useEffect(() => {
+        if (typeof window === 'undefined') return;
+        const sanitizedCache = readPlaylistShareReuseCache(window.localStorage);
+        writePlaylistShareReuseCache(window.localStorage, sanitizedCache);
     }, []);
 
     const closeAppNotice = useCallback(() => {
@@ -1104,6 +1307,7 @@ export default function HomePage() {
         setSharedPlaylistMode('none');
         setSharedPlaylistStatus('idle');
         setSharedPlaylistData(null);
+        setSharedPlaylistServerKey('');
     }, []);
 
     const hydrateSharedPlaylistFromLocation = useCallback(async (pathname: string, hashValue: string) => {
@@ -1113,50 +1317,136 @@ export default function HomePage() {
         sharedPlaylistLoadSeqRef.current = requestSeq;
 
         if (shareId) {
+            const decryptionKey = getSharedPlaylistKeyFromHash(hashValue);
             setSharedPlaylistMode('server');
             setSharedPlaylistStatus('loading');
             setSharedPlaylistData(null);
             try {
-                const record = await api.getPlaylistShare(shareId);
+                const record = await api.getPlaylistShare(shareId, {
+                    ...(decryptionKey ? { decryptionKey } : {}),
+                });
                 if (sharedPlaylistLoadSeqRef.current !== requestSeq) return;
                 setSharedPlaylistMode('server');
                 setSharedPlaylistStatus('ready');
                 setSharedPlaylistData(record);
+                setSharedPlaylistServerKey(decryptionKey);
                 showPlaylistShareHint('open');
             } catch (error: any) {
                 if (sharedPlaylistLoadSeqRef.current !== requestSeq) return;
                 const message = String(error?.message || '').toLowerCase();
                 setSharedPlaylistMode('server');
                 setSharedPlaylistData(null);
+                setSharedPlaylistServerKey(decryptionKey);
                 setSharedPlaylistStatus(message.includes('not found') ? 'not_found' : 'error');
             }
             return;
         }
 
         if (isHashPath) {
-            const decoded = decodeSharedPlaylistHash(hashValue);
-            if (!decoded) {
-                setSharedPlaylistMode('hash');
-                setSharedPlaylistData(null);
-                setSharedPlaylistStatus(String(hashValue || '').trim() ? 'error' : 'idle');
-                return;
-            }
             setSharedPlaylistMode('hash');
-            setSharedPlaylistStatus('ready');
-            setSharedPlaylistData({
-                version: 1,
-                shareId: 'hash',
-                createdAt: new Date().toISOString(),
-                playlist: decoded,
-            });
-            showPlaylistShareHint('open');
+            setSharedPlaylistStatus(String(hashValue || '').trim() ? 'error' : 'idle');
+            setSharedPlaylistData(null);
+            setSharedPlaylistServerKey('');
             return;
         }
 
         setSharedPlaylistMode('none');
         setSharedPlaylistStatus('idle');
         setSharedPlaylistData(null);
+        setSharedPlaylistServerKey('');
     }, [showPlaylistShareHint]);
+
+    useEffect(() => {
+        if (sharedPlaylistMode !== 'server' || sharedPlaylistStatus !== 'ready') return;
+        const shareId = String(sharedPlaylistData?.shareId || '').trim();
+        if (!shareId || !SHARED_PLAY_ID_REGEX.test(shareId)) return;
+        if (typeof window === 'undefined') return;
+
+        let cancelled = false;
+        let timerId: number | null = null;
+
+        const revalidate = async () => {
+            if (cancelled) return;
+            try {
+                const record = await api.getPlaylistShare(shareId, {
+                    ...(sharedPlaylistServerKey ? { decryptionKey: sharedPlaylistServerKey } : {}),
+                });
+                if (cancelled) return;
+                setSharedPlaylistMode('server');
+                setSharedPlaylistStatus('ready');
+                setSharedPlaylistData(record);
+                schedule();
+            } catch (error: any) {
+                if (cancelled) return;
+                const message = String(error?.message || '').toLowerCase();
+                if (message.includes('not found')) {
+                    setSharedPlaylistMode('server');
+                    setSharedPlaylistData(null);
+                    setSharedPlaylistStatus('not_found');
+                    window.location.reload();
+                    return;
+                }
+                schedule();
+            }
+        };
+
+        const schedule = () => {
+            if (cancelled) return;
+            timerId = window.setTimeout(() => {
+                void revalidate();
+            }, SHARED_PLAYLIST_REVALIDATE_INTERVAL_MS);
+        };
+
+        const handleVisibilityChange = () => {
+            if (cancelled) return;
+            if (typeof document !== 'undefined' && !document.hidden) {
+                if (timerId !== null) {
+                    window.clearTimeout(timerId);
+                    timerId = null;
+                }
+                void revalidate();
+            }
+        };
+
+        window.addEventListener('visibilitychange', handleVisibilityChange);
+        schedule();
+        return () => {
+            cancelled = true;
+            if (timerId !== null) {
+                window.clearTimeout(timerId);
+                timerId = null;
+            }
+            window.removeEventListener('visibilitychange', handleVisibilityChange);
+        };
+    }, [sharedPlaylistData?.shareId, sharedPlaylistMode, sharedPlaylistStatus, sharedPlaylistServerKey]);
+
+    useEffect(() => {
+        if (sharedPlaylistMode !== 'server' || sharedPlaylistStatus !== 'ready') return;
+        const currentShareId = String(sharedPlaylistData?.shareId || '').trim();
+        if (!currentShareId || !SHARED_PLAY_ID_REGEX.test(currentShareId)) return;
+        if (typeof window === 'undefined') return;
+
+        const handleStorage = (event: StorageEvent) => {
+            if (event.key !== SHARED_PLAYLIST_INVALIDATION_EVENT_KEY) return;
+            const rawPayload = String(event.newValue || '').trim();
+            if (!rawPayload) return;
+
+            try {
+                const parsed = JSON.parse(rawPayload);
+                const shareIds = Array.isArray(parsed?.shareIds)
+                    ? parsed.shareIds.map((shareId: unknown) => String(shareId || '').trim())
+                    : [];
+                if (!shareIds.includes(currentShareId)) return;
+                window.location.reload();
+            } catch {
+            }
+        };
+
+        window.addEventListener('storage', handleStorage);
+        return () => {
+            window.removeEventListener('storage', handleStorage);
+        };
+    }, [sharedPlaylistData?.shareId, sharedPlaylistMode, sharedPlaylistStatus]);
 
     const clearSidebarTimers = useCallback(() => {
         if (sidebarTimersRef.current.length === 0) return;
@@ -1387,6 +1677,16 @@ export default function HomePage() {
     }, [activeSearchTerm, isDesktopViewport]);
 
     useEffect(() => {
+        const previous = previousIsDesktopViewportRef.current;
+        previousIsDesktopViewportRef.current = isDesktopViewport;
+        if (!isDesktopViewport) return;
+        if (previous !== false) return;
+        if (!isSearchInputFocused) return;
+        searchInputRef.current?.blur();
+        setIsSearchInputFocused(false);
+    }, [isDesktopViewport, isSearchInputFocused]);
+
+    useEffect(() => {
         if (isDesktopViewport) return;
         setIsAlbumCommentsOpenMobile(false);
     }, [isDesktopViewport, selectedAlbum?.url]);
@@ -1416,6 +1716,15 @@ export default function HomePage() {
             setPlaylistStorageWarning('');
         }
     }, [isClient, playlists, playlistStorageWarning]);
+
+    useEffect(() => {
+        const validPlaylistIds = new Set(playlists.map((playlist) => String(playlist.id || '').trim()).filter(Boolean));
+        const existing = playlistShareSecretsRef.current;
+        Object.keys(existing).forEach((playlistId) => {
+            if (validPlaylistIds.has(playlistId)) return;
+            delete existing[playlistId];
+        });
+    }, [playlists]);
 
     useEffect(() => {
         if (sharedPlaylistMode !== 'none') {
@@ -1682,6 +1991,7 @@ export default function HomePage() {
         if (!options?.force && currentHistoryKey === 'album') {
             return;
         }
+        const hasTransientHistoryKey = !!currentHistoryKey;
         const currentPath = normalizeRoutePath(window.location.pathname);
         const currentParams = new URLSearchParams(window.location.search);
         const currentSearchTerm = String(currentParams.get('search') || '').trim();
@@ -1707,7 +2017,7 @@ export default function HomePage() {
         if (mode === 'push') {
             shouldPush = true;
         } else if (mode === 'auto') {
-            shouldPush = !!trimmedTerm && (!currentSearchTerm || currentPath !== homePath);
+            shouldPush = !!trimmedTerm && (!currentSearchTerm || currentPath !== homePath) && !hasTransientHistoryKey;
         }
         const currentState = (window.history.state && typeof window.history.state === 'object')
             ? window.history.state
@@ -1805,7 +2115,7 @@ export default function HomePage() {
                 url: path,
                 title: path.split('/').pop() || path,
                 albumId: normalizeAlbumId(path) || null,
-                icon: '/api/image?url=default-album-icon.jpg'
+                icon: ''
             };
             resetSearchState();
             setView('home');
@@ -2529,7 +2839,23 @@ export default function HomePage() {
     }, [getUniquePlaylistName]);
 
     const deletePlaylist = useCallback((playlistId: string) => {
-        if (playlistRouteIdentifier && selectedPlaylistId === playlistId) {
+        const normalizedPlaylistId = String(playlistId || '').trim();
+        if (!normalizedPlaylistId) return;
+
+        const cachedSecretsByShareId = playlistShareSecretsRef.current[normalizedPlaylistId] || {};
+        const cachedShareSecretEntries = Object.entries(cachedSecretsByShareId).map(([shareId, secret]) => ({
+            shareId: String(shareId || '').trim(),
+            editToken: String(secret?.editToken || '').trim(),
+        }));
+        delete playlistShareSecretsRef.current[normalizedPlaylistId];
+
+        if (typeof window !== 'undefined') {
+            const cachedShareMap = readPlaylistShareReuseCache(window.localStorage);
+            const nextShareMap = removePlaylistShareReuseCacheEntries(cachedShareMap, normalizedPlaylistId);
+            writePlaylistShareReuseCache(window.localStorage, nextShareMap);
+        }
+
+        if (playlistRouteIdentifier && selectedPlaylistId === normalizedPlaylistId) {
             setPlaylistRouteIdentifier(null);
             if (typeof window !== 'undefined') {
                 const targetPath = getPathForView('playlists');
@@ -2542,8 +2868,35 @@ export default function HomePage() {
                 }
             }
         }
-        setPlaylists((prev) => prev.filter((playlist) => playlist.id !== playlistId));
-        setSelectedPlaylistId((prev) => (prev === playlistId ? null : prev));
+        setPlaylists((prev) => prev.filter((playlist) => playlist.id !== normalizedPlaylistId));
+        setSelectedPlaylistId((prev) => (prev === normalizedPlaylistId ? null : prev));
+
+        if (cachedShareSecretEntries.length === 0) return;
+
+        const revocableEntries = cachedShareSecretEntries.filter((entry) => {
+            const shareId = String(entry.shareId || '').trim();
+            const editToken = String(entry.editToken || '').trim();
+            return Boolean(shareId && editToken);
+        });
+
+        void (async () => {
+            if (revocableEntries.length > 0) {
+                const revokeResults = await Promise.allSettled(
+                    revocableEntries.map((entry) =>
+                        api.revokePlaylistShare(String(entry.shareId || '').trim(), String(entry.editToken || '').trim())
+                    )
+                );
+
+                if (typeof window !== 'undefined') {
+                    const revokedShareIds = revokeResults
+                        .map((result, index) => ({ result, entry: revocableEntries[index] }))
+                        .filter(({ result }) => result.status === 'fulfilled')
+                        .map(({ entry }) => String(entry.shareId || '').trim())
+                        .filter((shareId) => !!shareId);
+                    notifySharedPlaylistInvalidation(window.localStorage, revokedShareIds);
+                }
+            }
+        })();
     }, [playlistRouteIdentifier, selectedPlaylistId]);
 
     const addTracksToPlaylist = useCallback((playlistId: string, rawTracks: any[]): PlaylistAddResult => {
@@ -2933,7 +3286,13 @@ export default function HomePage() {
     }, [playlists, showAppNotice]);
 
     const createPlaylistShareLink = useCallback(async (playlistId: string) => {
-        const targetPlaylist = playlists.find((playlist) => playlist.id === playlistId);
+        const normalizedPlaylistId = String(playlistId || '').trim();
+        if (!normalizedPlaylistId) {
+            showInlineToast('Could not find playlist to share.', 'error');
+            return;
+        }
+
+        const targetPlaylist = playlists.find((playlist) => playlist.id === normalizedPlaylistId);
         if (!targetPlaylist) {
             showInlineToast('Could not find playlist to share.', 'error');
             return;
@@ -2951,41 +3310,55 @@ export default function HomePage() {
 
         try {
             let reuseShareId = '';
+            let reuseShareKey = '';
             if (typeof window !== 'undefined') {
-                try {
-                    const rawCache = window.localStorage.getItem(PLAYLIST_SHARE_REUSE_CACHE_KEY);
-                    const parsed = rawCache ? JSON.parse(rawCache) : null;
-                    const cachedEntry = parsed && typeof parsed === 'object' ? (parsed as any)[playlistId] : null;
-                    const cachedShareId = String(cachedEntry?.shareId || '').trim();
-                    if (cachedShareId) {
-                        reuseShareId = cachedShareId;
-                    }
-                } catch {
+                const cachedShareMap = readPlaylistShareReuseCache(window.localStorage);
+                const cachedEntries = Array.isArray(cachedShareMap[normalizedPlaylistId])
+                    ? cachedShareMap[normalizedPlaylistId]
+                    : [];
+                const playlistSecrets = playlistShareSecretsRef.current[normalizedPlaylistId] || {};
+                const reusableEntry = cachedEntries.find((entry) => {
+                    const secret = playlistSecrets[String(entry.shareId || '').trim()];
+                    const shareKey = String(secret?.shareKey || '').trim();
+                    return !!shareKey;
+                });
+                if (reusableEntry) {
+                    reuseShareId = reusableEntry.shareId;
+                    reuseShareKey = String(playlistSecrets[reuseShareId]?.shareKey || '').trim();
                 }
             }
 
             const created = await api.createPlaylistShare(normalized.playlist, {
                 ...(reuseShareId ? { reuseShareId } : {}),
+                ...(reuseShareKey ? { reuseShareKey } : {}),
             });
 
             if (typeof window !== 'undefined') {
-                try {
-                    const rawCache = window.localStorage.getItem(PLAYLIST_SHARE_REUSE_CACHE_KEY);
-                    const parsed = rawCache ? JSON.parse(rawCache) : {};
-                    const nextCache = parsed && typeof parsed === 'object' ? { ...(parsed as Record<string, any>) } : {};
-                    nextCache[playlistId] = {
-                        shareId: created.shareId,
-                        updatedAt: Date.now(),
-                        ...(created.contentHash ? { contentHash: created.contentHash } : {}),
-                    };
+                const cachedShareMap = readPlaylistShareReuseCache(window.localStorage);
+                const existingForShare = (cachedShareMap[normalizedPlaylistId] || []).find((entry) => entry.shareId === created.shareId);
+                const contentHash = String(created.contentHash || existingForShare?.contentHash || '').trim();
+                const editToken = String(created.editToken || '').trim();
+                const shareKey = String(created.shareKey || '').trim();
 
-                    const sortedEntries = Object.entries(nextCache)
-                        .sort((a, b) => Number((b[1] as any)?.updatedAt || 0) - Number((a[1] as any)?.updatedAt || 0))
-                        .slice(0, PLAYLIST_SHARE_REUSE_CACHE_LIMIT);
-                    const pruned = Object.fromEntries(sortedEntries);
-                    window.localStorage.setItem(PLAYLIST_SHARE_REUSE_CACHE_KEY, JSON.stringify(pruned));
-                } catch {
+                if (shareKey || editToken) {
+                    const existingSecrets = playlistShareSecretsRef.current[normalizedPlaylistId] || {};
+                    const previous = existingSecrets[created.shareId] || { updatedAt: 0 };
+                    playlistShareSecretsRef.current[normalizedPlaylistId] = {
+                        ...existingSecrets,
+                        [created.shareId]: {
+                            updatedAt: Date.now(),
+                            ...(shareKey ? { shareKey } : (previous.shareKey ? { shareKey: previous.shareKey } : {})),
+                            ...(editToken ? { editToken } : (previous.editToken ? { editToken: previous.editToken } : {})),
+                        },
+                    };
                 }
+
+                const nextShareMap = upsertPlaylistShareReuseCacheEntry(cachedShareMap, normalizedPlaylistId, {
+                    shareId: created.shareId,
+                    updatedAt: Date.now(),
+                    ...(contentHash ? { contentHash } : {}),
+                });
+                writePlaylistShareReuseCache(window.localStorage, nextShareMap);
             }
 
             const copied = await copyTextToClipboard(created.url);
@@ -2997,31 +3370,8 @@ export default function HomePage() {
             }
             showPlaylistShareHint('share');
             return;
-        } catch (error) {
-            console.warn('Server share creation failed, trying hash fallback.', error);
-        }
-
-        try {
-            if (typeof window === 'undefined') {
-                showInlineToast('Fallback share link is only available in browser context.', 'error');
-                return;
-            }
-            const encodedHash = encodeSharedPlaylistHash(normalized.playlist);
-            const fallbackUrl = `${window.location.origin}/playlists/shared#${encodedHash}`;
-            if (fallbackUrl.length > MAX_SHARED_HASH_URL_LENGTH) {
-                showInlineToast('Playlist is too large for URL fallback. Use Export JSON instead.', 'error');
-                return;
-            }
-            const copied = await copyTextToClipboard(fallbackUrl);
-            if (copied) {
-                showInlineToast('Fallback share link copied to clipboard.', 'success');
-            } else {
-                showInlineToast('Could not copy automatically. Fallback link shown in popup.', 'error');
-                showAppNotice(`Fallback share link:\n${fallbackUrl}`, 'Playlist Shared');
-            }
-            showPlaylistShareHint('share');
         } catch (error: any) {
-            const message = String(error?.message || 'Failed to create fallback share link.');
+            const message = String(error?.message || 'Failed to create secure share link.');
             showInlineToast(message, 'error');
         }
     }, [copyTextToClipboard, playlists, showAppNotice, showInlineToast, showPlaylistShareHint]);
@@ -5876,11 +6226,14 @@ export default function HomePage() {
                                 <div className="top-header-search">
                                     <div className="search-input-wrapper">
                                         <input
+                                            ref={searchInputRef}
                                             type="text"
                                             value={query}
                                             onChange={(e) => setQuery(e.target.value)}
                                             onKeyDown={handleInputKey}
                                             onPaste={handleInputPaste}
+                                            onFocus={() => setIsSearchInputFocused(true)}
+                                            onBlur={() => setIsSearchInputFocused(false)}
                                             placeholder="Search the library or paste a URL..."
                                             className="search-input"
                                         />
@@ -6380,7 +6733,6 @@ export default function HomePage() {
                                                                             artist={String(item?.albumType || '').trim()}
                                                                             metaLine={String(item?.year || '').trim()}
                                                                             lightweightTextMode={shouldUseLightweightHomeCardText}
-                                                                            allowProxyFallback={true}
                                                                             pageShowSignal={pageShowSignal}
                                                                             selectPayload={item}
                                                                             onSelect={handleHomeCardSelect}
@@ -6419,7 +6771,6 @@ export default function HomePage() {
                                                                             artist={String(item?.albumType || '').trim()}
                                                                             metaLine={String(item?.year || '').trim()}
                                                                             lightweightTextMode={shouldUseLightweightHomeCardText}
-                                                                            allowProxyFallback={true}
                                                                             pageShowSignal={pageShowSignal}
                                                                             selectPayload={item}
                                                                             onSelect={handleHomeCardSelect}
@@ -6609,7 +6960,6 @@ export default function HomePage() {
                                                                                 artist={String(item?.albumType || '').trim()}
                                                                                 metaLine={String(item?.year || '').trim()}
                                                                                 lightweightTextMode={shouldUseLightweightHomeCardText}
-                                                                                allowProxyFallback={true}
                                                                                 pageShowSignal={pageShowSignal}
                                                                                 selectPayload={item}
                                                                                 onSelect={handleHomeCardSelect}
@@ -6647,7 +6997,6 @@ export default function HomePage() {
                                                                                 artist={String(item?.albumType || '').trim()}
                                                                                 metaLine={String(item?.year || '').trim()}
                                                                                 lightweightTextMode={shouldUseLightweightHomeCardText}
-                                                                                allowProxyFallback={true}
                                                                                 pageShowSignal={pageShowSignal}
                                                                                 selectPayload={item}
                                                                                 onSelect={handleHomeCardSelect}
@@ -6861,9 +7210,7 @@ export default function HomePage() {
                                                                                             fetchPriority="low"
                                                                                             alt=""
                                                                                             onError={(e: any) => {
-                                                                                                if (group.albumArt && !e.target.src.includes('/api/image')) {
-                                                                                                    e.target.src = `/api/image?url=${encodeURIComponent(group.albumArt)}`;
-                                                                                                }
+                                                                                                e.target.style.display = 'none';
                                                                                             }}
                                                                                         />
                                                                                     ) : (
@@ -6906,9 +7253,7 @@ export default function HomePage() {
                                                                                         fetchPriority="low"
                                                                                         alt=""
                                                                                         onError={(e: any) => {
-                                                                                            if (expandedGroup.albumArt && !e.target.src.includes('/api/image')) {
-                                                                                                e.target.src = `/api/image?url=${encodeURIComponent(expandedGroup.albumArt)}`;
-                                                                                            }
+                                                                                            e.target.style.display = 'none';
                                                                                         }}
                                                                                     />
                                                                                 ) : (

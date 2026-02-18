@@ -1,12 +1,46 @@
 import type { SearchAlbumsResponse, SearchFilters } from './search-types';
 import { isTimeoutLikeError } from './utils';
 import type { SharedPlaylistRecordV1, SharedPlaylistSnapshot } from './playlist-share';
-import { normalizeSharedPlaylistRecord } from './playlist-share';
+import { normalizeSharedPlaylistEncryptedRecord } from './playlist-share';
+import {
+    appendSharedPlaylistKeyToUrl,
+    computeSharedPlaylistContentHash,
+    decryptSharedPlaylistSnapshot,
+    encryptSharedPlaylistSnapshot,
+} from './playlist-share-crypto';
 import type { BrowseResponse, BrowseSectionKey } from './browse-types';
 import { LruCache } from './lru-cache';
 
 export class KhinsiderAPI {
     private readonly albumCache = new LruCache<string, any>(180);
+    private readonly searchCache = new LruCache<string, SearchAlbumsResponse>(220);
+    private readonly searchInFlight = new Map<string, Promise<SearchAlbumsResponse>>();
+    private readonly searchSessionPrefix = 'kh_search_v1:';
+
+    private getSearchSessionKey(cacheKey: string) {
+        return `${this.searchSessionPrefix}${cacheKey}`;
+    }
+
+    private readSearchSessionCache(cacheKey: string): SearchAlbumsResponse | null {
+        if (typeof window === 'undefined') return null;
+        try {
+            const raw = window.sessionStorage.getItem(this.getSearchSessionKey(cacheKey));
+            if (!raw) return null;
+            const parsed = JSON.parse(raw) as SearchAlbumsResponse;
+            if (!parsed || !Array.isArray(parsed.items)) return null;
+            return parsed;
+        } catch {
+            return null;
+        }
+    }
+
+    private writeSearchSessionCache(cacheKey: string, payload: SearchAlbumsResponse) {
+        if (typeof window === 'undefined') return;
+        try {
+            window.sessionStorage.setItem(this.getSearchSessionKey(cacheKey), JSON.stringify(payload));
+        } catch {
+        }
+    }
 
     private extractAlbumPath(input: string) {
         const raw = (input || '').trim();
@@ -79,9 +113,38 @@ export class KhinsiderAPI {
         const result = String(params?.result || '').trim();
         if (result) query.set('result', result);
 
-        const res = await fetch(`/api/search?${query.toString()}`);
-        if (!res.ok) throw new Error("Search Failed");
-        return await res.json();
+        const cacheKey = query.toString();
+        const memoryCached = this.searchCache.get(cacheKey);
+        if (memoryCached) {
+            return memoryCached;
+        }
+
+        const sessionCached = this.readSearchSessionCache(cacheKey);
+        if (sessionCached) {
+            this.searchCache.set(cacheKey, sessionCached);
+            return sessionCached;
+        }
+
+        const pending = this.searchInFlight.get(cacheKey);
+        if (pending) {
+            return pending;
+        }
+
+        const request = (async () => {
+            const res = await fetch(`/api/search?${cacheKey}`);
+            if (!res.ok) throw new Error("Search Failed");
+            const payload = await res.json() as SearchAlbumsResponse;
+            this.searchCache.set(cacheKey, payload);
+            this.writeSearchSessionCache(cacheKey, payload);
+            return payload;
+        })();
+
+        this.searchInFlight.set(cacheKey, request);
+        try {
+            return await request;
+        } finally {
+            this.searchInFlight.delete(cacheKey);
+        }
     }
 
     async search(query: string) {
@@ -125,20 +188,13 @@ export class KhinsiderAPI {
         };
     }
 
-    async createPlaylistShare(
-        snapshot: SharedPlaylistSnapshot,
-        options?: { reuseShareId?: string }
-    ): Promise<{ mode: 'server'; url: string; shareId: string; reused: boolean; contentHash?: string }> {
-        const reuseShareId = String(options?.reuseShareId || '').trim();
+    private async requestPlaylistShareCreate(body: Record<string, unknown>) {
         const res = await fetch('/api/playlist-share', {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json',
             },
-            body: JSON.stringify({
-                playlist: snapshot,
-                ...(reuseShareId ? { reuseShareId } : {}),
-            }),
+            body: JSON.stringify(body),
         });
 
         let payload: any = null;
@@ -161,12 +217,54 @@ export class KhinsiderAPI {
         }
 
         const contentHash = String(payload?.contentHash || '').trim();
+        const editToken = String(payload?.editToken || '').trim();
+
         return {
-            mode: 'server',
+            mode: 'server' as const,
             url,
             shareId,
             reused: Boolean(payload?.reused),
             ...(contentHash ? { contentHash } : {}),
+            ...(editToken ? { editToken } : {}),
+        };
+    }
+
+    async createPlaylistShare(
+        snapshot: SharedPlaylistSnapshot,
+        options?: { reuseShareId?: string; reuseShareKey?: string }
+    ): Promise<{ mode: 'server'; url: string; shareId: string; reused: boolean; contentHash?: string; editToken?: string; shareKey?: string }> {
+        const reuseShareId = String(options?.reuseShareId || '').trim();
+        const reuseShareKey = String(options?.reuseShareKey || '').trim();
+        const contentHash = await computeSharedPlaylistContentHash(snapshot);
+
+        if (reuseShareId && reuseShareKey) {
+            try {
+                const reused = await this.requestPlaylistShareCreate({
+                    reuseShareId,
+                    contentHash,
+                });
+                if (reused.reused) {
+                    return {
+                        ...reused,
+                        url: appendSharedPlaylistKeyToUrl(reused.url, reuseShareKey),
+                        shareKey: reuseShareKey,
+                    };
+                }
+            } catch {
+            }
+        }
+
+        const encryptedResult = await encryptSharedPlaylistSnapshot(snapshot);
+        const created = await this.requestPlaylistShareCreate({
+            encrypted: encryptedResult.encrypted,
+            contentHash,
+        });
+
+        const finalShareKey = encryptedResult.shareKey;
+        return {
+            ...created,
+            url: appendSharedPlaylistKeyToUrl(created.url, finalShareKey),
+            shareKey: finalShareKey,
         };
     }
 
@@ -203,13 +301,15 @@ export class KhinsiderAPI {
         return true;
     }
 
-    async getPlaylistShare(shareId: string): Promise<SharedPlaylistRecordV1> {
+    async getPlaylistShare(shareId: string, options?: { decryptionKey?: string }): Promise<SharedPlaylistRecordV1> {
         const normalizedShareId = String(shareId || '').trim();
         if (!normalizedShareId) {
             throw new Error('Shared playlist id is required.');
         }
 
-        const res = await fetch(`/api/playlist-share/${encodeURIComponent(normalizedShareId)}`);
+        const res = await fetch(`/api/playlist-share/${encodeURIComponent(normalizedShareId)}`, {
+            cache: 'no-store',
+        });
         let payload: any = null;
         try {
             payload = await res.json();
@@ -225,11 +325,23 @@ export class KhinsiderAPI {
             throw new Error(`Share Lookup Failed: ${reason}`);
         }
 
-        const normalized = normalizeSharedPlaylistRecord(payload);
-        if (!normalized) {
-            throw new Error('Share Lookup Failed: invalid payload.');
+        const normalizedEncrypted = normalizeSharedPlaylistEncryptedRecord(payload);
+        if (!normalizedEncrypted) {
+            throw new Error('Share Lookup Failed: encrypted payload expected.');
         }
-        return normalized;
+
+        const decryptionKey = String(options?.decryptionKey || '').trim();
+        if (!decryptionKey) {
+            throw new Error('Shared playlist key is required.');
+        }
+
+        const playlist = await decryptSharedPlaylistSnapshot(normalizedEncrypted.encrypted, decryptionKey);
+        return {
+            version: 1,
+            shareId: normalizedEncrypted.shareId,
+            createdAt: normalizedEncrypted.createdAt,
+            playlist,
+        };
     }
 
     async browse(params: { section: BrowseSectionKey; slug?: string; page?: number }): Promise<BrowseResponse> {

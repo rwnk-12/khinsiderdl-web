@@ -10,15 +10,8 @@ const GALLERY_GRID_GAP_PX = 20;
 const GALLERY_ITEM_META_HEIGHT = 30;
 const GALLERY_FULL_RES_EXTRA_ROWS = 2;
 
-const toProxyImageSrc = (rawUrl: string) => {
-    const value = String(rawUrl || '').trim();
-    if (!value) return '';
-    if (value.startsWith('/api/image?url=')) return value;
-    return `/api/image?url=${encodeURIComponent(value)}`;
-};
-
 const buildCandidates = (primary: string, secondary: string) => {
-    const list = [primary, toProxyImageSrc(primary), secondary, toProxyImageSrc(secondary)]
+    const list = [primary, secondary]
         .map((value) => String(value || '').trim())
         .filter(Boolean);
     const deduped: string[] = [];

@@ -45,6 +45,16 @@ const toAbsoluteUrl = (raw: string | null | undefined) => {
     return `${BASE_URL}${value.startsWith('/') ? value : `/${value}`}`;
 };
 
+const sanitizeBrowseMetaCellText = (raw: string | null | undefined) => {
+    const text = cleanText(raw || '');
+    if (!text) return '';
+    const compact = text.toLowerCase().replace(/\s+/g, '');
+    if (/^(remove|arrow_drop_up|arrow_drop_down)([+-]\d+)?$/.test(compact)) {
+        return '';
+    }
+    return text;
+};
+
 const normalizeAlbumId = (raw?: string | null) => {
     const input = String(raw || '').trim();
     if (!input) return '';
@@ -185,8 +195,8 @@ const parseBrowseItems = (html: string) => {
             cleanText(row.find('td').eq(1).text()) ||
             extractAlbumTitleFromHref(href);
         const icon = String(row.find('td').eq(0).find('img').first().attr('src') || '').trim();
-        const albumType = cleanText(row.find('td').eq(3).text());
-        const year = cleanText(row.find('td').eq(4).text());
+        const albumType = sanitizeBrowseMetaCellText(row.find('td').eq(3).text());
+        const year = sanitizeBrowseMetaCellText(row.find('td').eq(4).text());
 
         addBrowseItem(itemMap, {
             href,
@@ -227,7 +237,9 @@ const parseBrowseItems = (html: string) => {
             const rowCells = row.find('td');
             if (!rowCells.length) return;
 
-            const titleLink = rowCells.eq(1).find('a[href*="/game-soundtracks/album/"]').first();
+            const titleLink = row.find('a[href*="/game-soundtracks/album/"]')
+                .filter((_, linkEl) => cleanText($(linkEl).text()).length > 0)
+                .first();
             const iconLink = cell.find('a[href*="/game-soundtracks/album/"]').first();
             const link = titleLink.length ? titleLink : iconLink;
             if (!link.length) return;
@@ -238,11 +250,12 @@ const parseBrowseItems = (html: string) => {
             const title =
                 cleanText(titleLink.text()) ||
                 cleanText(link.text()) ||
+                cleanText(rowCells.eq(2).text()) ||
                 cleanText(rowCells.eq(1).text()) ||
                 extractAlbumTitleFromHref(href);
             const icon = String(cell.find('img').first().attr('src') || '').trim();
-            const albumType = rowCells.length >= 4 ? cleanText(rowCells.eq(3).text()) : '';
-            const year = rowCells.length >= 5 ? cleanText(rowCells.eq(4).text()) : '';
+            const albumType = rowCells.length >= 4 ? sanitizeBrowseMetaCellText(rowCells.eq(3).text()) : '';
+            const year = rowCells.length >= 5 ? sanitizeBrowseMetaCellText(rowCells.eq(4).text()) : '';
 
             addBrowseItem(itemMap, {
                 href,
@@ -275,8 +288,8 @@ const parseBrowseItems = (html: string) => {
             ).trim();
 
             const cells = row.find('td');
-            const albumType = cells.length >= 4 ? cleanText(cells.eq(3).text()) : '';
-            const year = cells.length >= 5 ? cleanText(cells.eq(4).text()) : '';
+            const albumType = cells.length >= 4 ? sanitizeBrowseMetaCellText(cells.eq(3).text()) : '';
+            const year = cells.length >= 5 ? sanitizeBrowseMetaCellText(cells.eq(4).text()) : '';
 
             addBrowseItem(itemMap, {
                 href,

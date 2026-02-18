@@ -1,15 +1,12 @@
 import { json } from '../_shared/khinsider';
 import {
-    buildSharedPlaylistRecord,
     generateShareId,
-    normalizeSharedPlaylistPayload,
+    normalizeSharedPlaylistEncryptedPayload,
     SHARED_PLAY_ID_REGEX,
 } from '../../../lib/playlist-share';
 import {
-    computePlaylistShareContentHash,
     readPlaylistShareLinkRecord,
-    readPlaylistShareRecord,
-    writePlaylistShareRecord,
+    writeEncryptedPlaylistShareRecord,
 } from '../../../lib/server/playlist-share-store';
 
 export const runtime = 'nodejs';
@@ -94,6 +91,14 @@ const isShareCollisionError = (error: unknown) => {
     return String((error as any)?.message || '').toLowerCase().includes('already exists');
 };
 
+const HASH_64_REGEX = /^[a-f0-9]{64}$/;
+
+const normalizeContentHash = (rawValue: unknown) => {
+    const normalized = String(rawValue || '').trim().toLowerCase();
+    if (!HASH_64_REGEX.test(normalized)) return '';
+    return normalized;
+};
+
 export async function POST(request: Request) {
     const ip = getClientIp(request);
     if (!checkRateLimit(ip)) {
@@ -107,40 +112,34 @@ export async function POST(request: Request) {
         return jsonNoStore({ error: 'Invalid JSON body.' }, 400);
     }
 
-    const normalized = normalizeSharedPlaylistPayload(payload?.playlist || payload);
-    if (!normalized.ok) {
-        return jsonNoStore({ error: normalized.error }, normalized.status);
-    }
-
     try {
-        const contentHash = computePlaylistShareContentHash(normalized.playlist);
         const reuseShareIdRaw = String(payload?.reuseShareId || '').trim();
         const reuseShareId = SHARED_PLAY_ID_REGEX.test(reuseShareIdRaw) ? reuseShareIdRaw : '';
 
-        if (reuseShareId) {
+        const providedContentHash = normalizeContentHash(payload?.contentHash);
+        if (reuseShareId && providedContentHash) {
             const existingLink = await readPlaylistShareLinkRecord(reuseShareId);
-            if (existingLink && !existingLink.revoked && existingLink.contentHash === contentHash) {
+            if (existingLink && !existingLink.revoked && existingLink.encrypted && existingLink.contentHash === providedContentHash) {
                 const url = buildShareUrl(request, reuseShareId);
-                return jsonNoStore({ mode: 'server', shareId: reuseShareId, url, reused: true, contentHash }, 200);
+                return jsonNoStore({ mode: 'server', shareId: reuseShareId, url, reused: true, contentHash: providedContentHash }, 200);
             }
+        }
 
-            if (!existingLink) {
-                const legacyRecord = await readPlaylistShareRecord(reuseShareId);
-                if (legacyRecord) {
-                    const legacyHash = computePlaylistShareContentHash(legacyRecord.playlist);
-                    if (legacyHash === contentHash) {
-                        const url = buildShareUrl(request, reuseShareId);
-                        return jsonNoStore({ mode: 'server', shareId: reuseShareId, url, reused: true, contentHash }, 200);
-                    }
-                }
-            }
+        const encryptedPayload = normalizeSharedPlaylistEncryptedPayload(payload?.encrypted);
+        if (!encryptedPayload) {
+            return jsonNoStore({ error: 'Encrypted share payload is required.' }, 400);
+        }
+
+        const contentHash = providedContentHash;
+        if (!contentHash) {
+            return jsonNoStore({ error: 'A valid contentHash is required.' }, 400);
         }
 
         if (!checkGlobalWriteRateLimit()) {
             return jsonNoStore({ error: 'Share writes are rate-limited. Please retry shortly.' }, 429);
         }
 
-        const enableRevocation = false;
+        const enableRevocation = true;
         let shareId = '';
         let recordCreated = false;
         let editToken = '';
@@ -148,9 +147,12 @@ export async function POST(request: Request) {
 
         for (let attempt = 0; attempt < 5; attempt += 1) {
             shareId = generateShareId();
-            const record = buildSharedPlaylistRecord(shareId, normalized.playlist);
             try {
-                const writeResult = await writePlaylistShareRecord(record, { enableRevocation });
+                const writeResult = await writeEncryptedPlaylistShareRecord({
+                    shareId,
+                    contentHash,
+                    encrypted: encryptedPayload,
+                }, { enableRevocation });
                 editToken = String(writeResult.editToken || '').trim();
                 createdContentHash = writeResult.contentHash || createdContentHash;
                 recordCreated = true;

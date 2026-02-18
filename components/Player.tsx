@@ -65,8 +65,6 @@ export const Player = ({
 
     const [mobileArtSource, setMobileArtSource] = useState('');
     const [desktopArtSource, setDesktopArtSource] = useState('');
-    const [mobileUseProxyFallback, setMobileUseProxyFallback] = useState(false);
-    const [desktopUseProxyFallback, setDesktopUseProxyFallback] = useState(false);
     const snapVolumePercent = (value: number) => {
         if (!Number.isFinite(value)) return 0;
         const clamped = Math.max(0, Math.min(100, value));
@@ -87,13 +85,6 @@ export const Player = ({
         return `${m}:${s.toString().padStart(2, '0')}`;
     };
 
-    const toProxyImageSrc = (rawUrl: string) => {
-        const value = String(rawUrl || '').trim();
-        if (!value) return '';
-        if (value.startsWith('/api/image?url=')) return value;
-        return `/api/image?url=${encodeURIComponent(value)}`;
-    };
-
     const toSmallThumbUrl = (rawUrl: string) => {
         const value = String(rawUrl || '').trim();
         if (!value) return '';
@@ -102,18 +93,11 @@ export const Player = ({
 
     const handleArtworkError = (
         currentSource: string,
-        useProxyFallback: boolean,
-        setUseProxyFallback: React.Dispatch<React.SetStateAction<boolean>>,
         setSource: React.Dispatch<React.SetStateAction<string>>
     ) => {
-        if (!useProxyFallback) {
-            setUseProxyFallback(true);
-            return;
-        }
         const fallbackSmall = toSmallThumbUrl(currentSource);
         if (fallbackSmall && fallbackSmall !== currentSource) {
             setSource(fallbackSmall);
-            setUseProxyFallback(false);
             return;
         }
         setSource('');
@@ -121,12 +105,10 @@ export const Player = ({
 
     useEffect(() => {
         setMobileArtSource(String(albumArt || thumbnail || '').trim());
-        setMobileUseProxyFallback(false);
     }, [albumArt, thumbnail]);
 
     useEffect(() => {
         setDesktopArtSource(String(thumbnail || albumArt || '').trim());
-        setDesktopUseProxyFallback(false);
     }, [thumbnail, albumArt]);
 
     useEffect(() => {
@@ -266,8 +248,8 @@ export const Player = ({
 
     if (!track) return null;
 
-    const mobileArtSrc = mobileUseProxyFallback ? toProxyImageSrc(mobileArtSource) : mobileArtSource;
-    const desktopArtSrc = desktopUseProxyFallback ? toProxyImageSrc(desktopArtSource) : desktopArtSource;
+    const mobileArtSrc = mobileArtSource;
+    const desktopArtSrc = desktopArtSource;
     const speedFillPercent = Math.max(0, Math.min(100, ((speedSliderPercent - 50) / 150) * 100));
     const playbackRateLabel = `${(speedSliderPercent / 100).toFixed(2)}x`;
 
@@ -295,8 +277,6 @@ export const Player = ({
                                 fetchPriority={isMobileFullScreen ? 'high' : 'auto'}
                                 onError={() => handleArtworkError(
                                     mobileArtSource,
-                                    mobileUseProxyFallback,
-                                    setMobileUseProxyFallback,
                                     setMobileArtSource
                                 )}
                             />
@@ -441,8 +421,6 @@ export const Player = ({
                                 fetchPriority="high"
                                 onError={() => handleArtworkError(
                                     desktopArtSource,
-                                    desktopUseProxyFallback,
-                                    setDesktopUseProxyFallback,
                                     setDesktopArtSource
                                 )}
                             />

@@ -3960,11 +3960,27 @@ body {
 .playlist-identifier-tracklist.is-virtualized {
   max-height: min(66vh, 740px);
   overflow-y: auto;
+  overflow-anchor: none;
+  contain: layout paint;
+}
+
+.playlist-identifier-tracklist.is-virtualized .playlists-track-head,
+.playlist-identifier-tracklist.is-virtualized .playlists-track-row,
+.playlist-identifier-tracklist.is-virtualized .playlist-identifier-virtual-spacer {
+  flex: 0 0 auto;
+}
+
+.playlist-identifier-tracklist.is-virtualized .playlists-track-row {
+  content-visibility: visible;
+  contain-intrinsic-size: auto;
 }
 
 .playlist-identifier-virtual-spacer {
+  display: block;
   width: 100%;
+  flex: 0 0 auto;
   pointer-events: none;
+  overflow-anchor: none;
 }
 
 .playlists-track-row {
