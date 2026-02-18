@@ -6761,7 +6761,6 @@ input[type=range].mobile-seek::-webkit-slider-thumb {
   margin: -0.1rem 0 0.8rem;
   padding: 0.58rem 0 0.08rem;
   border-top: 1px solid rgba(138, 106, 56, 0.25);
-  max-width: min(100%, 820px);
   line-height: 1.16;
   color: var(--c-gold-deep);
 }
@@ -6835,7 +6834,6 @@ input[type=range].mobile-seek::-webkit-slider-thumb {
   margin: 0 0 0.8rem;
   padding: 0.64rem 0 0.08rem;
   border-top: 1px solid rgba(138, 106, 56, 0.25);
-  max-width: min(100%, 920px);
   color: var(--c-ink);
 }
 
