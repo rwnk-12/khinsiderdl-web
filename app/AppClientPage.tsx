@@ -909,8 +909,14 @@ export default function HomePage() {
     const [searchPagination, setSearchPagination] = useState<SearchPagination>(DEFAULT_SEARCH_PAGINATION);
     const [searchTotalMatches, setSearchTotalMatches] = useState<number | null>(null);
     const [isSearchAppending, setIsSearchAppending] = useState(false);
-    const [isSidebarOpen, setIsSidebarOpen] = useState(true);
-    const [isSidebarVisible, setIsSidebarVisible] = useState(true);
+    const [isSidebarOpen, setIsSidebarOpen] = useState(() => {
+        if (typeof window === 'undefined') return true;
+        return window.matchMedia('(min-width: 769px)').matches;
+    });
+    const [isSidebarVisible, setIsSidebarVisible] = useState(() => {
+        if (typeof window === 'undefined') return true;
+        return window.matchMedia('(min-width: 769px)').matches;
+    });
     const [isSidebarShifted, setIsSidebarShifted] = useState(false);
     const [isSidebarHandoff, setIsSidebarHandoff] = useState(false);
     const [selectedAlbum, setSelectedAlbum] = useState<any>(null);
@@ -6434,9 +6440,10 @@ export default function HomePage() {
                                                         >
                                                             {(shouldVirtualizeTrackList ? virtualizedFilteredAlbumTracks : filteredAlbumTracks).map(({ track: t, originalIndex: i }: any) => {
                                                                 const isCurrent = currentTrack && currentTrack.title === t.title && currentTrack.albumName === selectedAlbum.name;
+                                                                const rowHostClass = `${shouldVirtualizeTrackList ? 'virtual-track-row' : 'track-row-host'} ${i % 2 === 1 ? 'is-zebra' : ''}`.trim();
                                                                 return (
                                                                     <div
-                                                                        className={shouldVirtualizeTrackList ? 'virtual-track-row' : undefined}
+                                                                        className={rowHostClass}
                                                                         data-track-index={i}
                                                                         key={t.url || `${i}-${t.title}`}
                                                                     >

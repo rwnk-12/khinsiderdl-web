@@ -1433,7 +1433,8 @@ body {
   min-width: 0;
 }
 
-.track-list.is-virtualized .virtual-track-row:nth-child(even) .track-row {
+.track-list .track-row-host.is-zebra,
+.track-list .virtual-track-row.is-zebra {
   background: rgba(138, 106, 56, 0.05);
 }
 
@@ -1474,10 +1475,6 @@ body {
   pointer-events: none;
   border-right: 1px solid rgba(197, 160, 89, 0.6);
   will-change: width;
-}
-
-.track-row:nth-child(even) {
-  background: rgba(138, 106, 56, 0.05);
 }
 
 .track-row:hover {
