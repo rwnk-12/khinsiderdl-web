@@ -74,7 +74,7 @@ const PlaylistsView = dynamic(() => import('../components/PlaylistsView').then((
     ),
 });
 
-const DISCORD_URL = "https://discord.gg/yuvnx7FS89";
+const DISCORD_URL = "https://discord.gg/invite-link";
 const GITHUB_URL = "https://github.com/rwnk-12/khinsiderdl-web/";
 const LIKED_ALBUM_META_CACHE_KEY = 'kh_liked_album_meta_cache_v3';
 const LEGACY_LIKED_ALBUM_META_CACHE_KEY = 'kh_liked_album_meta_cache_v2';
@@ -7501,5 +7501,6 @@ export default function HomePage() {
         </>
     );
 }
+
 
 
