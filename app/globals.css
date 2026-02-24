@@ -336,7 +336,45 @@ body {
   display: flex;
   align-items: center;
   justify-content: flex-end;
+  gap: 0.46rem;
   min-width: 2.25rem;
+}
+
+.top-header-github-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.34rem;
+  padding: 0;
+  min-height: auto;
+  text-decoration: none;
+  color: #fff;
+  line-height: 1;
+  white-space: nowrap;
+  transition: opacity 0.16s ease;
+}
+
+.top-header-github-link:hover {
+  color: #fff;
+  opacity: 0.82;
+}
+
+.top-header-github-link:focus-visible {
+  outline: 2px solid rgba(255, 255, 255, 0.85);
+  outline-offset: 2px;
+}
+
+.top-header-github-link svg {
+  flex: 0 0 auto;
+  display: block;
+  overflow: visible;
+}
+
+.github-label {
+  font-family: 'Inter', 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  color: #fff;
+  font-size: 0.8rem;
+  font-weight: 500;
+  letter-spacing: 0;
 }
 
 .top-header-queue-btn {
@@ -6038,6 +6076,14 @@ input[type=range].mobile-seek::-webkit-slider-thumb {
     height: 2.05rem;
   }
 
+  .top-header-github-link {
+    gap: 0;
+  }
+
+  .github-label {
+    display: none;
+  }
+
   .search-input-wrapper {
     margin-top: 0;
     width: 100%;
@@ -7976,6 +8022,25 @@ a.album-comment-user:hover {
 
   .top-header-right {
     min-width: 32px;
+  }
+
+  .top-header-github-link {
+    color: #fff;
+    width: 32px;
+    height: 32px;
+    min-height: 32px;
+    padding: 0;
+    gap: 0;
+    justify-content: center;
+  }
+
+  .top-header-github-link:hover {
+    color: #fff;
+    opacity: 0.82;
+  }
+
+  .github-label {
+    display: none;
   }
 
   .top-header-queue-btn {

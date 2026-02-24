@@ -75,6 +75,7 @@ const PlaylistsView = dynamic(() => import('../components/PlaylistsView').then((
 });
 
 const DISCORD_URL = "https://discord.gg/yuvnx7FS89";
+const GITHUB_URL = "https://github.com/rwnk-12/khinsiderdl-web/";
 const LIKED_ALBUM_META_CACHE_KEY = 'kh_liked_album_meta_cache_v3';
 const LEGACY_LIKED_ALBUM_META_CACHE_KEY = 'kh_liked_album_meta_cache_v2';
 
@@ -948,6 +949,7 @@ export default function HomePage() {
     const [pageShowSignal, setPageShowSignal] = useState(0);
 
     const [isClient, setIsClient] = useState(false);
+    const [hasHydratedLocalState, setHasHydratedLocalState] = useState(false);
     const [hasInitialRouteSync, setHasInitialRouteSync] = useState(false);
     const [playerMode, setPlayerMode] = useState<'standard' | 'minimized'>('standard');
     const [currentTrack, setCurrentTrack] = useState<any>(null);
@@ -1539,49 +1541,55 @@ export default function HomePage() {
 
         const hydrateLocalState = () => {
             if (disposed) return;
-
-            const savedMode = localStorage.getItem('playerMode');
-            if (savedMode === 'minimized' || savedMode === 'standard') {
-                setPlayerMode(savedMode);
-            }
-            const savedRepeat = localStorage.getItem('playerRepeatEnabled');
-            if (savedRepeat === '1' || savedRepeat === 'true') {
-                setIsRepeatEnabled(true);
-            }
-
-            const savedLikes = readLikedTracksFromStorage(window.localStorage);
-            if (savedLikes.length > 0) {
-                const baseNow = Date.now();
-                setLikedTracks(savedLikes.map((track: unknown, index: number) => {
-                    const source = (track && typeof track === 'object') ? (track as Record<string, unknown>) : {};
-                    const rawLikedAt = Number(source.likedAt ?? source.addedAt ?? 0);
-                    const likedAt = Number.isFinite(rawLikedAt) && rawLikedAt > 0
-                        ? Math.floor(rawLikedAt)
-                        : Math.max(1, baseNow - index);
-                    return normalizeLikedTrack({ ...source, likedAt });
-                }));
-            }
-
-            const savedLikedMetaCache = localStorage.getItem(LIKED_ALBUM_META_CACHE_KEY)
-                || localStorage.getItem(LEGACY_LIKED_ALBUM_META_CACHE_KEY);
-            if (!savedLikedMetaCache) return;
-
             try {
-                const parsed = JSON.parse(savedLikedMetaCache);
-                if (!parsed || typeof parsed !== 'object') return;
-                const baseNow = Date.now();
-                const cleaned: Record<string, any> = {};
-                Object.entries(parsed).forEach(([key, value], index) => {
-                    if (!value || typeof value !== 'object') return;
-                    const fallbackTs = baseNow - index;
-                    const stamped = withLikedMetaCacheTimestamp(value, fallbackTs);
-                    cleaned[key] = stamped;
-                    const albumId = normalizeAlbumId((value as any)?.albumId || (value as any)?.canonicalUrl);
-                    if (albumId) cleaned[`id:${albumId}`] = stamped;
-                });
-                setLikedAlbumMetaCache(pruneLikedAlbumMetaCache(cleaned, LIKED_META_CACHE_MAX_ENTRIES));
+                const savedMode = localStorage.getItem('playerMode');
+                if (savedMode === 'minimized' || savedMode === 'standard') {
+                    setPlayerMode(savedMode);
+                }
+                const savedRepeat = localStorage.getItem('playerRepeatEnabled');
+                if (savedRepeat === '1' || savedRepeat === 'true') {
+                    setIsRepeatEnabled(true);
+                }
+
+                const savedLikes = readLikedTracksFromStorage(window.localStorage);
+                if (savedLikes.length > 0) {
+                    const baseNow = Date.now();
+                    setLikedTracks(savedLikes.map((track: unknown, index: number) => {
+                        const source = (track && typeof track === 'object') ? (track as Record<string, unknown>) : {};
+                        const rawLikedAt = Number(source.likedAt ?? source.addedAt ?? 0);
+                        const likedAt = Number.isFinite(rawLikedAt) && rawLikedAt > 0
+                            ? Math.floor(rawLikedAt)
+                            : Math.max(1, baseNow - index);
+                        return normalizeLikedTrack({ ...source, likedAt });
+                    }));
+                }
+
+                const savedLikedMetaCache = localStorage.getItem(LIKED_ALBUM_META_CACHE_KEY)
+                    || localStorage.getItem(LEGACY_LIKED_ALBUM_META_CACHE_KEY);
+                if (savedLikedMetaCache) {
+                    try {
+                        const parsed = JSON.parse(savedLikedMetaCache);
+                        if (parsed && typeof parsed === 'object') {
+                            const baseNow = Date.now();
+                            const cleaned: Record<string, any> = {};
+                            Object.entries(parsed).forEach(([key, value], index) => {
+                                if (!value || typeof value !== 'object') return;
+                                const fallbackTs = baseNow - index;
+                                const stamped = withLikedMetaCacheTimestamp(value, fallbackTs);
+                                cleaned[key] = stamped;
+                                const albumId = normalizeAlbumId((value as any)?.albumId || (value as any)?.canonicalUrl);
+                                if (albumId) cleaned[`id:${albumId}`] = stamped;
+                            });
+                            setLikedAlbumMetaCache(pruneLikedAlbumMetaCache(cleaned, LIKED_META_CACHE_MAX_ENTRIES));
+                        }
+                    } catch (e) {
+                        console.error("Failed to parse liked album meta cache", e);
+                    }
+                }
             } catch (e) {
-                console.error("Failed to parse liked album meta cache", e);
+                console.error("Failed to hydrate local state", e);
+            } finally {
+                setHasHydratedLocalState(true);
             }
         };
 
@@ -1698,16 +1706,15 @@ export default function HomePage() {
     }, [isDesktopViewport, selectedAlbum?.url]);
 
     useEffect(() => {
-        if (isClient) {
-            writeLikedTracksToStorage(window.localStorage, likedTracks);
-        }
-    }, [likedTracks, isClient]);
+        if (!isClient || !hasHydratedLocalState) return;
+        writeLikedTracksToStorage(window.localStorage, likedTracks);
+    }, [hasHydratedLocalState, likedTracks, isClient]);
 
     useEffect(() => {
-        if (!isClient) return;
+        if (!isClient || !hasHydratedLocalState) return;
         const prunedCache = pruneLikedAlbumMetaCache(likedAlbumMetaCache, LIKED_META_CACHE_MAX_ENTRIES);
         localStorage.setItem(LIKED_ALBUM_META_CACHE_KEY, JSON.stringify(prunedCache));
-    }, [likedAlbumMetaCache, isClient]);
+    }, [hasHydratedLocalState, likedAlbumMetaCache, isClient]);
 
     useEffect(() => {
         if (!isClient) return;
@@ -6258,7 +6265,17 @@ export default function HomePage() {
                                             <Icon name="download" size={18} />
                                         </button>
                                     )}
-                                    <div className="top-header-right-spacer desktop-only" aria-hidden="true"></div>
+                                    <a
+                                        href={GITHUB_URL}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="top-header-github-link"
+                                        aria-label="Open Github repository"
+                                        title="Open Github repository"
+                                    >
+                                        <Icon name="github" size={14} />
+                                        <span className="github-label">Github</span>
+                                    </a>
                                 </div>
                             </div>
                             <div className="top-header-separator"></div>
